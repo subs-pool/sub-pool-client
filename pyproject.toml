@@ -1,0 +1,28 @@
+[project]
+name = "sub-pool-client"
+dynamic = ["version"]
+description = "Drop-in ClaudeSDKClient replacement that routes through a sub-pool server."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.63",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/subs-pool/sub-pool-client"
+Repository = "https://github.com/subs-pool/sub-pool-client"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { version_scheme = "guess-next-dev", local_scheme = "node-and-date", fallback_version = "0.0.0+nogit" }
+
+[tool.hatch.build.hooks.vcs]
+version-file = "sub_pool_client/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sub_pool_client"]
