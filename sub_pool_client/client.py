@@ -122,6 +122,7 @@ class PooledClient(ClaudeSDKClient):
         key = dir_key(
             pool_url=self._pool_url,
             api_key=self._api_key,
+            provider="claude",
             user_id=self._user_id,
             required_model=self._required_model,
         )
@@ -340,7 +341,7 @@ class PooledClient(ClaudeSDKClient):
 
     # ============================================================ HTTP
     async def _post_lease(self) -> dict:
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = {"provider": "claude"}
         if self._user_id:
             body["user_id"] = self._user_id
         if self._request_id_req:

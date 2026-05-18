@@ -1,17 +1,21 @@
 [project]
 name = "sub-pool-client"
 dynamic = ["version"]
-description = "Drop-in ClaudeSDKClient replacement that routes through a sub-pool server."
+description = "Python client for sub-pool: drop-in ClaudeSDKClient + Codex helper + `cpool` CLI."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.63",
     "httpx>=0.27",
+    "click>=8.1",
 ]
 
 [project.urls]
 Homepage = "https://github.com/subs-pool/sub-pool-client"
 Repository = "https://github.com/subs-pool/sub-pool-client"
+
+[project.scripts]
+cpool = "sub_pool_client.cli:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

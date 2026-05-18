@@ -45,12 +45,19 @@ def dir_key(
     *,
     pool_url: str,
     api_key: str,
+    provider: str = "claude",
     user_id: str | None = None,
     required_model: str | None = None,
 ) -> str:
     """Deterministic short hash. Same inputs → same shared dir → two
     concurrent PooledClient instances meet."""
-    parts = [pool_url.rstrip("/"), api_key, user_id or "", required_model or ""]
+    parts = [
+        provider or "claude",
+        pool_url.rstrip("/"),
+        api_key,
+        user_id or "",
+        required_model or "",
+    ]
     digest = hashlib.sha256("|".join(parts).encode()).hexdigest()
     return digest[:24]
 
@@ -246,6 +253,34 @@ def read_credentials(dir_: Path) -> dict | None:
     return bundle_from_cli_schema(raw)
 
 
+def write_codex_auth(dir_: Path, auth_json: dict) -> None:
+    """Atomic Codex auth.json write in $CODEX_HOME."""
+    p = dir_ / "auth.json"
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(auth_json, f, indent=2)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, p)
+
+
+def read_codex_auth(dir_: Path) -> dict | None:
+    p = dir_ / "auth.json"
+    if not p.exists():
+        return None
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 def cleanup_dir(dir_: Path) -> None:
     """Remove the shared dir. Idempotent."""
     try:
@@ -264,6 +299,8 @@ __all__ = [
     "dir_key",
     "locked_meta",
     "read_credentials",
+    "read_codex_auth",
     "shared_dir",
+    "write_codex_auth",
     "write_credentials",
 ]
