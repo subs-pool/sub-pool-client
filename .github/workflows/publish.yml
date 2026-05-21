@@ -1,14 +1,21 @@
 name: publish
 
-# Tag-driven publish for both `sub-pool-client` (real package) and
-# `sub-pool` (placeholder pointing at the client). TestPyPI runs first
+# Tag-driven publish for sub-pool-client. TestPyPI runs first
 # unconditionally; the PyPI job is gated by the `pypi` GitHub
-# environment, which the repo admin configures to require manual
-# approval before either real publish goes out.
+# environment (configure it to require a reviewer so the real publish
+# doesn't go out without a click).
 #
-# Trusted Publishing is used for both packages on both indexes — no
-# long-lived tokens. Owner / repo / workflow / environment must match
-# the four "pending publishers" registered on PyPI + TestPyPI.
+# Trusted Publishing — no long-lived tokens. Two pending publishers
+# need to be registered (owner=subs-pool, repo=sub-pool-client,
+# workflow=publish.yml):
+#
+#   - PyPI       env=pypi      project=sub-pool-client
+#   - TestPyPI   env=testpypi  project=sub-pool-client
+#
+# The companion `sub-pool` placeholder distribution (see meta/) is
+# wired up in source but NOT in this workflow — register a pending
+# publisher for it and add the build/publish jobs back when you want
+# to claim the short name on PyPI.
 
 on:
   push:
@@ -19,7 +26,7 @@ permissions:
   contents: read
 
 jobs:
-  build-client:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,28 +43,11 @@ jobs:
         run: python -m build
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-client
+          name: dist
           path: dist/
 
-  build-meta:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install build
-        run: pip install build
-      - name: Build sub-pool placeholder
-        working-directory: meta
-        run: python -m build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-meta
-          path: meta/dist/
-
-  testpypi-client:
-    needs: build-client
+  testpypi:
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -67,41 +57,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist-client
+          name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
-          # Re-running the workflow with the same tag (e.g., after a
-          # cosmetic README fix that doesn't bump the version) should
-          # not hard-fail on TestPyPI — skip the upload if the version
-          # is already there.
+          # Allow re-running the workflow on the same tag (cosmetic
+          # README amends etc.) without hard-failing on a duplicate
+          # version.
           skip-existing: true
 
-  testpypi-meta:
-    needs: build-meta
-    runs-on: ubuntu-latest
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/project/sub-pool/
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist-meta
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          # The placeholder has a static 0.0.1 — every release after
-          # the first will try to re-upload 0.0.1, which already exists.
-          # `skip-existing` makes the job a no-op in that case rather
-          # than failing the whole publish.
-          skip-existing: true
-
-  pypi-client:
-    needs: testpypi-client
+  pypi:
+    needs: testpypi
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -111,23 +78,6 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist-client
+          name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
-
-  pypi-meta:
-    needs: testpypi-meta
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/sub-pool/
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist-meta
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
