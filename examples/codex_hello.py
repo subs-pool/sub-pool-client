@@ -1,4 +1,4 @@
-"""Minimal codex usage through the pool.
+"""Minimal Codex usage through the pool.
 
 Before running:
   1. Install:    uv pip install -e .

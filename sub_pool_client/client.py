@@ -113,10 +113,6 @@ class PooledClient(ClaudeSDKClient):
         self._poll_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
 
-        # Tracked usage
-        self._input_tokens = 0
-        self._output_tokens = 0
-
     # ============================================================ lifecycle
     async def __aenter__(self) -> "PooledClient":
         key = dir_key(
@@ -376,10 +372,7 @@ class PooledClient(ClaudeSDKClient):
     async def _delete_lease(
         self, lease_id: str, exc: BaseException | None,
     ) -> None:
-        body: dict[str, Any] = {
-            "input_tokens": self._input_tokens,
-            "output_tokens": self._output_tokens,
-        }
+        body: dict[str, Any] = {}
         if exc is not None:
             body["error_code"] = type(exc).__name__
             body["error_message"] = str(exc)[:2000]
@@ -416,13 +409,6 @@ class PooledClient(ClaudeSDKClient):
             log.warning("report_error %s: %s", r.status_code, r.text[:200])
             return {}
         return r.json()
-
-    # ============================================================ usage
-    def report_usage(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
-        """Feed ResultMessage.usage into this so the DELETE body carries
-        meaningful token counts for pool metrics."""
-        self._input_tokens += int(input_tokens)
-        self._output_tokens += int(output_tokens)
 
     # ============================================================ introspection
     @property

@@ -88,9 +88,6 @@ class PooledCodexClient:
         self._heartbeat_task: asyncio.Task | None = None
         self._is_poll_leader: bool = False
 
-        self._input_tokens = 0
-        self._output_tokens = 0
-
     async def __aenter__(self) -> "PooledCodexClient":
         key = dir_key(
             pool_url=self._pool_url,
@@ -148,9 +145,6 @@ class PooledCodexClient:
     def request_id(self) -> str | None:
         return self._lease_request_id
 
-    def report_usage(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
-        self._input_tokens += int(input_tokens)
-        self._output_tokens += int(output_tokens)
 
     async def report_error(self, code: str, message: str) -> dict:
         """Mid-lease: tell the pool about a backend error (429, quota,
@@ -380,10 +374,7 @@ class PooledCodexClient:
     async def _delete_lease(
         self, lease_id: str, exc: BaseException | None,
     ) -> None:
-        body: dict[str, Any] = {
-            "input_tokens": self._input_tokens,
-            "output_tokens": self._output_tokens,
-        }
+        body: dict[str, Any] = {}
         if exc is not None:
             body["error_code"] = type(exc).__name__
             body["error_message"] = str(exc)[:2000]

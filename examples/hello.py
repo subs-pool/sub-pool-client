@@ -2,9 +2,9 @@
 
 Before running:
   1. Install:    uv pip install -e .
-  2. Have a running sub-pool server
-  3. Log in an account via the admin UI + create an API key
-  4. Run:        SUB_POOL_URL=http://localhost:8787 \
+  2. Have a running sub-pool server with at least one connected Claude
+     account and an API key.
+  3. Run:        SUB_POOL_URL=http://localhost:8787 \
                  SUB_POOL_KEY=cp-... \
                  python examples/hello.py
 
@@ -38,12 +38,6 @@ async def _run_once(prompt: str) -> bool:
         try:
             await client.query(prompt)
             async for msg in client.receive_response():
-                usage = getattr(msg, "usage", None)
-                if isinstance(usage, dict):
-                    client.report_usage(
-                        input_tokens=int(usage.get("input_tokens") or 0),
-                        output_tokens=int(usage.get("output_tokens") or 0),
-                    )
                 content = getattr(msg, "content", None)
                 if content:
                     for block in content:

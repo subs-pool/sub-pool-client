@@ -37,7 +37,7 @@ from typing import AsyncIterator
 
 DEFAULT_ROOT = Path(
     os.environ.get("SUB_POOL_CLIENT_DIR")
-    or Path.home() / ".sub-pool-client"
+    or Path.home() / ".sub-pool" / "client"
 )
 
 

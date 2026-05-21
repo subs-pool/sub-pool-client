@@ -1,7 +1,7 @@
 [project]
 name = "sub-pool-client"
 dynamic = ["version"]
-description = "Python client for sub-pool: drop-in ClaudeSDKClient + Codex helper + `cpool` CLI."
+description = "Python client + `sp-claude` / `sp-codex` CLIs for a sub-pool credential broker."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,13 +15,16 @@ Homepage = "https://github.com/subs-pool/sub-pool-client"
 Repository = "https://github.com/subs-pool/sub-pool-client"
 
 [project.scripts]
-cpool = "sub_pool_client.cli:main"
+sp-claude = "sub_pool_client.cli_claude:main"
+sp-codex = "sub_pool_client.cli_codex:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
+# Mirror is a standalone repo — let hatch-vcs read this mirror's own
+# git tags, no `root = ".."` indirection like the monorepo.
 source = "vcs"
 raw-options = { version_scheme = "guess-next-dev", local_scheme = "node-and-date", fallback_version = "0.0.0+nogit" }
 

@@ -1,22 +1,22 @@
 # sub-pool-client
 
-Python client for a [sub-pool](https://github.com/the-upstream-org/sub-pool)
-server — a credential broker for N Claude **and** OpenAI Codex
-subscription accounts. This package gives you three things:
+Python client + interactive CLIs for a
+[sub-pool](https://github.com/the private upstream repo) server — a credential
+broker for N Claude **and** OpenAI Codex subscription accounts.
 
-1. **`PooledClient`** — a drop-in subclass of `ClaudeSDKClient` from the
-   official `claude-agent-sdk`. Leases short-lived OAuth access tokens
-   from the pool, writes them into a `CLAUDE_CONFIG_DIR`, and lets the
-   local `claude` CLI run normally.
-2. **`PooledCodexClient`** — equivalent helper for OpenAI Codex. Leases
-   a Codex `auth.json`, writes it into an isolated `CODEX_HOME`, and
-   lets you spawn `codex exec` locally. Backed by the same pool, with
-   the pool owning the OAuth refresh chain so concurrent leases on one
-   ChatGPT account don't race-rotate each other.
-3. **`cpool` CLI** — a `claude`-binary wrapper: `cpool` runs the real
-   `claude` CLI with credentials transparently leased + auto-refreshed
-   from the pool. Use it as a drop-in `claude` replacement in shells
-   and scripts.
+You get three things in one package:
+
+1. **`sp-claude`** — a `claude` CLI wrapper. Leases a Claude account
+   from the pool, runs the real `claude` binary against a per-session
+   `CLAUDE_CONFIG_DIR`, rotates the access_token in the background, and
+   swaps accounts transparently if the leased one cools mid-run.
+2. **`sp-codex`** — same flow for OpenAI Codex. Leases a Codex
+   `auth.json`, drops it into an isolated `CODEX_HOME`, spawns the
+   real `codex` binary, and rotates the token in the background.
+3. **`PooledClient` / `PooledCodexClient`** — Python SDK classes for
+   programs and services. `PooledClient` is a drop-in subclass of
+   `ClaudeSDKClient` from the official `claude-agent-sdk`;
+   `PooledCodexClient` is a thin async wrapper around `codex exec`.
 
 The agent loop — tool execution, filesystem I/O, hooks, MCP servers,
 the codex subprocess — all stays on the consumer's machine. The pool
@@ -32,31 +32,54 @@ uv pip install git+https://github.com/subs-pool/sub-pool-client
 
 ## Environment
 
-Both flows need:
+Both the CLIs and the SDK read:
 
 ```bash
 export SUB_POOL_URL=http://your-pool-host:8787
-export SUB_POOL_KEY=cp-...   # admin gives you an API key from the UI
+export SUB_POOL_KEY=cp-...   # admin issues this from the sub-pool UI
 ```
 
 `SUB_POOL_KEY`'s strategy decides which accounts you can reach.
 
-## 1. Claude
+## 1. CLIs
 
-### `cpool` CLI (drop-in `claude` wrapper)
+### `sp-claude` — `claude` wrapper
 
 ```bash
-cpool --setup            # one-time interactive config wizard
-cpool                    # start the claude REPL on a leased account
-cpool -p "explain this"  # single-prompt mode
-cpool --account claude-pro   # pin to a specific account (subject to strategy)
-cpool --status           # show effective config and exit
+sp-claude --setup            # one-time interactive config wizard
+sp-claude                    # start the claude REPL on a leased account
+sp-claude "explain this"     # single-prompt mode
+sp-claude --account alice    # pin to a specific account
+sp-claude --status           # show effective config and exit
 ```
 
-`cpool` foregrounds the real `claude` binary so SDK options
-(`--mcp-config`, `--allowed-tools`, `--cwd`, etc.) pass straight through.
+`sp-claude --setup` writes pool URL + API key to `~/.sub-pool/cli.toml`
+at `0o600`. Subsequent invocations exec `claude` against a per-session
+config dir that holds the leased `.credentials.json`. The persistent
+home (`~/.sub-pool/claude-home/`) keeps your conversation history
+across sessions and is isolated from `~/.claude/` — `sp-claude` never
+reads or writes your real claude config.
 
-### `PooledClient` (Python SDK)
+If the leased account starts cooling (Anthropic rate-limit or quota
+window), a background watcher swaps to a different account
+transparently. Your running session sees one continuous `claude`
+process; only the access_token under the hood changes.
+
+### `sp-codex` — `codex` wrapper
+
+```bash
+sp-codex --setup
+sp-codex                     # interactive REPL on a leased Codex account
+sp-codex exec "summarize ."  # one-shot
+sp-codex --account codex1
+```
+
+Shares `~/.sub-pool/cli.toml` with `sp-claude`. Persistent
+`CODEX_HOME` lives at `~/.sub-pool/codex-home/`.
+
+## 2. Python SDK
+
+### `PooledClient` (Claude)
 
 ```python
 import asyncio
@@ -64,171 +87,108 @@ from claude_agent_sdk import ClaudeAgentOptions
 from sub_pool_client import PooledClient
 
 async def main():
-    options = ClaudeAgentOptions(
-        system_prompt="You are a terse assistant.",
-    )
+    options = ClaudeAgentOptions(system_prompt="Be terse.")
     async with PooledClient(options=options) as client:
-        print(f"leased account={client.account} lease_id={client.lease_id}")
+        print(f"leased {client.account} lease_id={client.lease_id}")
         await client.query("List three prime numbers.")
         async for msg in client.receive_response():
-            usage = getattr(msg, "usage", None)
-            if isinstance(usage, dict):
-                client.report_usage(
-                    input_tokens=int(usage.get("input_tokens") or 0),
-                    output_tokens=int(usage.get("output_tokens") or 0),
-                )
             print(type(msg).__name__, "->", msg)
 
 asyncio.run(main())
 ```
 
-```bash
-python examples/hello.py
-```
+`PooledClient` subclasses `ClaudeSDKClient`, so every option the SDK
+accepts (hooks, MCP servers, `cwd`, `allowed_tools`,
+`permission_mode`) works unchanged.
 
-`PooledClient` is a true subclass of `ClaudeSDKClient`. Every option the
-SDK accepts (hooks, MCP servers, `cwd`, `allowed_tools`,
-`permission_mode`) works unchanged — the pool never sees them.
-
-### Multi-turn sessions
-
-`__aenter__` leases once and a background task polls the pool for a
-fresh access_token ~10 min before expiry, atomic-rewriting
-`.credentials.json`. Long sessions work without code changes:
+#### Rate-limit handling
 
 ```python
-async with PooledClient(options=options) as client:
-    for prompt in ["first", "second", "third"]:
-        await client.query(prompt)
-        async for msg in client.receive_response():
-            ...
-```
+from claude_agent_sdk import ClaudeSDKError
 
-Prompt-cache hits are up to the official SDK — it's running locally so
-Anthropic sees the same `session_id` across turns.
-
-### Reporting rate limits / errors
-
-If Anthropic returns 429 mid-run, tell the pool so the account gets
-cooled and the next lease skips it:
-
-```python
 async with PooledClient(options=options) as client:
     try:
         await client.query("...")
         async for msg in client.receive_response():
             ...
-    except Exception as e:
+    except ClaudeSDKError as e:
         if "429" in str(e) or "rate" in str(e).lower():
-            await client.report_error("RateLimit", str(e)[:500])
+            await client.report_error("RateLimit", str(e))
         raise
 ```
 
-See `examples/hello.py` for a retry loop that routes to a different
-account on rate limit.
+`report_error` posts to `/credentials/lease/{id}/report-error`; the
+pool marks the account COOLING so the next lease skips it.
 
-## 2. Codex
+#### Concurrent agents
+
+Multiple `async with PooledClient()` calls in the same process — or
+across sibling processes — with identical routing inputs (`user_id`,
+`required_model`) **share a single lease**. Coordination happens
+through `~/.sub-pool/client/<hash>/` (flock + holder list). First
+arriver leases; later arrivers refcount; last out releases. So N
+parallel agents on one account work up to Anthropic's per-account
+concurrency limit. Vary `user_id` (with the `sticky_user` strategy)
+to force different accounts in parallel.
+
+### `PooledCodexClient` (Codex)
 
 ```python
 import asyncio
 from sub_pool_client import PooledCodexClient
 
 async def main():
-    async with PooledCodexClient(
-        user_id="alice",   # optional
-    ) as codex:
-        print(f"leased {codex.account} lease_id={codex.lease_id}")
-
-        # codex.exec spawns `codex exec <prompt>` with CODEX_HOME pointing
-        # at the leased auth.json. Returns an asyncio subprocess; caller
-        # waits / streams as needed.
+    async with PooledCodexClient() as codex:
         proc = await codex.exec(
             "summarize this repository",
-            "--cd", ".",
+            cwd=".",
             model="gpt-5.5",
-            json_output=True,
         )
         stdout, stderr = await proc.communicate()
         print(stdout.decode())
 
-        if proc.returncode != 0 and b"rate" in stderr.lower():
-            await codex.report_error("RateLimit", stderr.decode()[:500])
-
 asyncio.run(main())
 ```
 
-You can also run the `codex` CLI manually using the prepared environment:
+`PooledCodexClient` writes the leased (sanitized) `auth.json` into an
+isolated `CODEX_HOME` and spawns `codex exec` against it. A
+background poll task rotates the on-disk `auth.json` before the
+access_token expires. On a backend error, call
+`await codex.report_error("RateLimit", "...")` so the pool cools the
+account.
 
-```python
-import subprocess
-async with PooledCodexClient() as codex:
-    subprocess.run(
-        ["codex", "exec", "hello"],
-        env=codex.env,   # has CODEX_HOME pointing at the leased auth.json
-    )
+## Pool invariants this client relies on
+
+- The pool exclusively owns the `refresh_token` chain (both Anthropic
+  and OpenAI). Leases hand out only the access_token; the
+  `refreshToken` field in the leased credentials file is blank.
+- Token rotation happens through `POST
+  /credentials/lease/{lease_id}/token` — a consumer crash can never
+  leak the pool's refresh state.
+- `account_name`s come from the pool's admin config. The pool decides
+  which account fulfills each lease based on the API key's strategy.
+
+See [the private upstream repo](https://github.com/the private upstream repo) for the
+pool server, admin UI, and strategy reference.
+
+## Layout under `~/.sub-pool/`
+
+```
+~/.sub-pool/
+├── cli.toml                 # sp-claude / sp-codex shared config (0o600)
+├── claude-home/             # sp-claude persistent CLAUDE_CONFIG_DIR
+├── codex-home/              # sp-codex persistent CODEX_HOME
+└── client/<hash>/           # PooledClient / PooledCodexClient
+                             #   cross-process lease coordination
 ```
 
-**Pool owns the refresh chain**: the leased `auth.json` carries a fresh
-access_token but a blanked `refresh_token`. A background poll task asks
-the pool for a refreshed access_token before expiry and rewrites the
-local `auth.json` atomically — codex CLI picks it up on its next call.
-Concurrent leases on the same Codex account are safe.
+Override the SDK shared-dir root with `SUB_POOL_CLIENT_DIR`.
 
-## Concurrent usage (same process)
+## Examples
 
-Multiple `async with PooledClient()` (or `PooledCodexClient()`) in the
-same process with identical routing (`pool_url`, `api_key`, `user_id`,
-`required_model`) share a single lease. The local CLI subprocesses all
-read the same on-disk credentials and coordinate refresh via the pool,
-so N parallel agents on one account "just work" up to whatever the
-upstream provider's concurrency limit is on that account.
-
-Want true parallelism across accounts? Use different `user_id`s with
-the `sticky_user` strategy or use different API keys.
-
-## Configuration
-
-| Env var | Required | Notes |
-|---|---|---|
-| `SUB_POOL_URL` | ✅* | Pool base URL (`http://host:8787`) |
-| `SUB_POOL_KEY` | ✅* | API key bearer |
-| `SUB_POOL_CLIENT_DIR` | — | Override `~/.sub-pool-client/` shared-dir root |
-
-`*` can also be passed as kwargs: `PooledClient(pool_url=..., api_key=...)`.
-
-`cpool --setup` writes these to `~/.config/sub-pool/cpool.toml` and
-re-reads them on every invocation, so you don't need them in your
-shell after first-time setup.
-
-## Public surface
-
-```python
-from sub_pool_client import (
-    PooledClient,          # claude SDK wrapper
-    PooledCodexClient,     # codex helper
-    PoolError,             # base exception
-    PoolConnectionError,   # network / pool unreachable
-    PoolAuthError,         # 401 / 403 from pool itself
-    PoolUpstreamError,     # pool returned 4xx/5xx with a code
-    PoolAcquireTimeoutError,
-    PoolProtocolError,
-)
-```
-
-Both `PooledClient` and `PooledCodexClient` expose:
-
-- `.account`, `.lease_id`, `.request_id` — lease identity
-- `.report_usage(input_tokens=, output_tokens=)` — bump pool's stats
-- `await .report_error(code, message)` — cool the account upstream
-
-## Requires
-
-- Python ≥ 3.12
-- `claude-agent-sdk` ≥ 0.1.63
-- A running [sub-pool](https://github.com/the-upstream-org/sub-pool) server
-- For Codex: the official `codex` CLI installed locally (the pool host
-  no longer needs it — only consumers running codex do)
+- `examples/hello.py` — `PooledClient` end-to-end with a retry loop on 429.
+- `examples/codex_hello.py` — `PooledCodexClient` running `codex exec`.
 
 ## License
 
-Not yet specified.
+(TBD — defer to upstream)

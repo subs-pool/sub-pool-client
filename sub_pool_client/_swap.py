@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING
 import httpx
 
 if TYPE_CHECKING:
-    from sub_pool_client.cli import PoolHTTP
+    from sub_pool_client._cli_core import PoolHTTP
+    from sub_pool_client._cli_provider import CliProvider
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class NoSwapAvailable(Exception):
 
 async def swap_credentials(
     pool: "PoolHTTP", current: dict, session_dir: Path,
+    provider: "CliProvider",
     *, account: str | None = None,
 ) -> dict:
     """Replace the lease backing `session_dir` with a fresh one.
@@ -66,12 +68,9 @@ async def swap_credentials(
 
     Returns the new lease dict (also stored at `current["lease"]`).
     """
-    # Local import to avoid the cli ↔ swap cycle at module-load time.
-    from sub_pool_client.cli import write_credentials_file
-
     old_lease_id = current["lease"]["lease_id"]
     try:
-        new_lease = await pool.lease(account=account)
+        new_lease = await pool.lease(provider, account=account)
     except httpx.HTTPStatusError as e:
         # 503 = strategy says no candidate (all cooling / invalid).
         # Anything else: surface as no-swap-available so the watcher
@@ -85,15 +84,15 @@ async def swap_credentials(
         raise NoSwapAvailable(f"pool unreachable: {e}") from e
 
     if new_lease.get("lease_id") == old_lease_id:
-        # Strategy handed back the same lease — happens if cpool passes
+        # Strategy handed back the same lease — happens if the CLI passes
         # `account=` and that account is still the only candidate. Not a
         # real swap; treat as nothing-to-do so we don't churn.
         raise NoSwapAvailable("strategy returned the same lease_id")
 
     # === Sync block — no await between disk write and current update.
-    # Write disk first so a `write_credentials_file` exception leaves the
+    # Write disk first so a `write_credentials` exception leaves the
     # caller's view (`current`) consistent with what's actually on disk.
-    write_credentials_file(session_dir, new_lease)
+    provider.write_credentials(session_dir / provider.cred_filename, new_lease)
     current["lease"] = new_lease
     # === End sync block.
 

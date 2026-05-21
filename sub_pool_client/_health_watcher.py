@@ -30,7 +30,7 @@ class HealthWatcher:
     ):
         # `fetch` is a no-argument coroutine that returns the health dict
         # — passed as a closure so it captures the *current* lease id
-        # even after a swap rotates it (cpool updates the captured lease
+        # even after a swap rotates it (the CLI updates the captured lease
         # in place via a small mutable container).
         self._fetch = fetch
         self._on_unhealthy = on_unhealthy
