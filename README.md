@@ -25,9 +25,17 @@ only sees lease lifecycles.
 ## Install
 
 ```bash
-pip install git+https://github.com/subs-pool/sub-pool-client
+pip install sub-pool-client
 # or
-uv pip install git+https://github.com/subs-pool/sub-pool-client
+uv pip install sub-pool-client
+```
+
+[![PyPI](https://img.shields.io/pypi/v/sub-pool-client.svg)](https://pypi.org/project/sub-pool-client/)
+
+Latest release tracks `main`. To install from source instead:
+
+```bash
+pip install git+https://github.com/subs-pool/sub-pool-client
 ```
 
 ## Environment
