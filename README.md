@@ -1,8 +1,8 @@
 # sub-pool-client
 
-Python client + interactive CLIs for a
-[sub-pool](https://github.com/the private upstream repo) server — a credential
-broker for N Claude **and** OpenAI Codex subscription accounts.
+Python client + interactive CLIs for a `sub-pool` server — a
+credential broker for N Claude **and** OpenAI Codex subscription
+accounts.
 
 You get three things in one package:
 
@@ -168,8 +168,9 @@ account.
 - `account_name`s come from the pool's admin config. The pool decides
   which account fulfills each lease based on the API key's strategy.
 
-See [the private upstream repo](https://github.com/the private upstream repo) for the
-pool server, admin UI, and strategy reference.
+The `sub-pool` server (admin UI, strategy reference, account
+lifecycle) is hosted separately — point this client at whatever pool
+URL your admin gave you via `SUB_POOL_URL` above.
 
 ## Layout under `~/.sub-pool/`
 
