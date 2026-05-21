@@ -1,0 +1,24 @@
+[project]
+name = "sub-pool"
+version = "0.0.1"
+description = "Reserved name — `pip install sub-pool` resolves to `sub-pool-client`. The pool server itself is upstream-only."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["sub-pool-client"]
+
+[project.urls]
+Homepage = "https://github.com/subs-pool/sub-pool-client"
+Repository = "https://github.com/subs-pool/sub-pool-client"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Placeholder distribution — no Python module shipped, so no namespace
+# collision with the upstream `sub_pool` server module. Hatchling needs
+# `force-include` to build a wheel with no Python packages.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.sdist]
+include = ["pyproject.toml", "README.md"]
