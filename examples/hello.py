@@ -1,10 +1,10 @@
 """Minimal end-to-end usage (credential-broker mode).
 
 Before running:
-  1. Install:    uv pip install -e .
-  2. Have a running sub-pool server with at least one connected Claude
-     account and an API key.
-  3. Run:        SUB_POOL_URL=http://localhost:8787 \
+  1. Install:    uv pip install -e . -e ./client
+  2. Run pool:   docker compose up -d (see /home/user/sub_pool_instance/)
+  3. Log in an account via the admin UI + create an API key
+  4. Run:        SUB_POOL_URL=http://localhost:8787 \
                  SUB_POOL_KEY=cp-... \
                  python examples/hello.py
 

@@ -77,6 +77,11 @@ class Meta:
     # Stays None when no leader has been elected yet (e.g. during
     # bring-up, or after a graceful leader exit before a takeover).
     poll_leader: int | None = None
+    # Account name returned by the pool for this lease. Persisted so
+    # late-arriving holders that JOIN an existing lease can report the
+    # right account through `client.account` — they never saw the
+    # original `POST /credentials/lease` response themselves.
+    account: str | None = None
 
     @classmethod
     def from_json(cls, d: dict) -> "Meta":
@@ -84,6 +89,7 @@ class Meta:
             lease_id=d.get("lease_id"),
             holders=list(d.get("holders") or []),
             poll_leader=d.get("poll_leader"),
+            account=d.get("account"),
         )
 
     def to_json(self) -> dict:
@@ -91,6 +97,7 @@ class Meta:
             "lease_id": self.lease_id,
             "holders": self.holders or [],
             "poll_leader": self.poll_leader,
+            "account": self.account,
         }
 
 

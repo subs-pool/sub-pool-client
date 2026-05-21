@@ -175,6 +175,7 @@ class PooledClient(ClaudeSDKClient):
             if meta.lease_id and meta.holders:
                 # Active lease already present — reuse it.
                 self._lease_id = meta.lease_id
+                self._lease_account = meta.account
                 # Always append (one entry per __aenter__, not per pid)
                 # so N `async with` in the same pid are refcounted by
                 # N removes on exit.
@@ -203,6 +204,7 @@ class PooledClient(ClaudeSDKClient):
                 bundle.get("expires_at") or lease.get("token_expires_at") or 0.0
             )
             meta.lease_id = self._lease_id
+            meta.account = self._lease_account
             meta.holders = [my_pid]
             meta.poll_leader = my_pid
             self._is_first_holder = True

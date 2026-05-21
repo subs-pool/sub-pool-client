@@ -204,6 +204,7 @@ class PooledCodexClient:
             if meta.lease_id and meta.holders:
                 # Active lease already present — reuse it.
                 self._lease_id = meta.lease_id
+                self._lease_account = meta.account
                 meta.holders.append(my_pid)
                 # locked_meta cleared dead-pid leaders, so poll_leader is
                 # either a live pid or None. Claim leadership right away
@@ -228,6 +229,7 @@ class PooledCodexClient:
             self._lease_request_id = lease.get("request_id")
             self._token_expires_at = float(lease.get("token_expires_at") or 0.0)
             meta.lease_id = self._lease_id
+            meta.account = self._lease_account
             meta.holders = [my_pid]
             meta.poll_leader = my_pid
             self._is_poll_leader = True

@@ -57,6 +57,32 @@ def _write_codex_auth(path: Path, lease: dict) -> None:
     _atomic_write_json(path, auth)
 
 
+def _seed_claude_home(home: Path) -> None:
+    """Pre-write a minimal `.claude.json` so Claude Code's first-run
+    onboarding wizard does not appear inside the leased REPL.
+
+    Claude Code gates its onboarding wizard on the presence of
+    `hasCompletedOnboarding` in `$CLAUDE_CONFIG_DIR/.claude.json` —
+    not on whether `.credentials.json` already holds a valid OAuth
+    token. Worse, the wizard's "Sign in with Claude account" path
+    starts a *new* browser OAuth flow rather than reusing the leased
+    `.credentials.json`, so falling into the wizard wipes out the
+    pool's credential entirely.
+
+    Idempotent: only writes when no `.claude.json` exists yet. If a
+    future Claude Code release changes the wizard contract, deleting
+    `~/.sub-pool/claude-home/.claude.json` and re-running sp-claude
+    is enough to inspect the new schema by hand.
+    """
+    claude_json = home / ".claude.json"
+    if claude_json.exists():
+        return
+    _atomic_write_json(claude_json, {
+        "hasCompletedOnboarding": True,
+        "lastOnboardingVersion": "2.1.144",
+    })
+
+
 def _atomic_write_json(path: Path, payload: Any) -> None:
     """Create at 0o600 from the start (no readable window) and atomic-rename."""
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -102,6 +128,10 @@ class CliProvider:
     # Pluggable credential writer — kept on the provider so the engine
     # never has to switch on `name`.
     write_credentials: Callable[[Path, dict], None]
+    # Optional first-run hook called on the persistent home dir before
+    # symlinks get laid down. Used by Claude to seed a no-onboarding
+    # `.claude.json`; Codex doesn't need it.
+    init_home: Callable[[Path], None] | None = None
 
 
 CLAUDE = CliProvider(
@@ -118,6 +148,7 @@ CLAUDE = CliProvider(
     ),
     lease_body_extras={},
     write_credentials=_write_claude_credentials,
+    init_home=_seed_claude_home,
 )
 
 

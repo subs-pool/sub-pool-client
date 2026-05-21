@@ -90,13 +90,29 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config | None":
-        if not CONFIG_PATH.exists():
-            return None
-        import tomllib
-        data = tomllib.loads(CONFIG_PATH.read_text())
+        """Resolve pool_url + api_key from env vars first, falling back
+        to `~/.sub-pool/cli.toml`. Per-provider sections (bin paths /
+        default accounts) come from the TOML only — env vars cover the
+        pool credentials, which is what CI / Docker / ephemeral runs
+        actually need.
+
+        Returns None only when neither source supplies both pool_url
+        AND api_key — that's the "go run --setup" signal in main().
+        """
+        env_url = (os.environ.get("SUB_POOL_URL") or "").strip()
+        env_key = (os.environ.get("SUB_POOL_KEY") or "").strip()
+
+        data: dict = {}
+        if CONFIG_PATH.exists():
+            import tomllib
+            data = tomllib.loads(CONFIG_PATH.read_text())
+
         pool = data.get("pool") or {}
-        if not pool.get("url") or not pool.get("api_key"):
+        pool_url = env_url or (pool.get("url") or "")
+        api_key = env_key or (pool.get("api_key") or "")
+        if not pool_url or not api_key:
             return None
+
         per_provider: dict[str, dict[str, str]] = {}
         for name in ("claude", "codex"):
             section = data.get(name)
@@ -105,7 +121,7 @@ class Config:
                     k: str(v) for k, v in section.items()
                     if isinstance(v, (str, int, float))
                 }
-        return cls(pool_url=pool["url"], api_key=pool["api_key"],
+        return cls(pool_url=pool_url, api_key=api_key,
                    per_provider=per_provider)
 
     def write(self) -> None:
@@ -270,6 +286,12 @@ def setup_session_dir(
     """
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
+    # Seed any first-run state the provider needs in its persistent
+    # home (claude wants a `.claude.json` so Code's onboarding wizard
+    # is skipped on the leased REPL). Runs before the symlink loop so
+    # the seeded file shows up in the session dir too.
+    if provider.init_home is not None:
+        provider.init_home(home)
     for entry in home.iterdir():
         if _is_per_session(entry.name, provider.cred_skip_prefixes):
             continue
