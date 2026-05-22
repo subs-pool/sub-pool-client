@@ -1,16 +1,12 @@
 name: publish
 
-# Tag-driven publish for sub-pool-client. TestPyPI runs first
-# unconditionally; the PyPI job is gated by the `pypi` GitHub
-# environment (configure it to require a reviewer so the real publish
-# doesn't go out without a click).
+# Tag-driven publish for sub-pool-client. The PyPI job is gated by the
+# `pypi` GitHub environment (configure it to require a reviewer so the
+# real publish doesn't go out without a click).
 #
-# Trusted Publishing — no long-lived tokens. Two pending publishers
-# need to be registered (owner=subs-pool, repo=sub-pool-client,
-# workflow=publish.yml):
-#
-#   - PyPI       env=pypi      project=sub-pool-client
-#   - TestPyPI   env=testpypi  project=sub-pool-client
+# Trusted Publishing — no long-lived tokens. One pending publisher
+# needs to be registered (owner=subs-pool, repo=sub-pool-client,
+# workflow=publish.yml, env=pypi, project=sub-pool-client).
 #
 # The companion `sub-pool` placeholder distribution (see meta/) is
 # wired up in source but NOT in this workflow — register a pending
@@ -46,29 +42,8 @@ jobs:
           name: dist
           path: dist/
 
-  testpypi:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/project/sub-pool-client/
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          # Allow re-running the workflow on the same tag (cosmetic
-          # README amends etc.) without hard-failing on a duplicate
-          # version.
-          skip-existing: true
-
   pypi:
-    needs: testpypi
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
