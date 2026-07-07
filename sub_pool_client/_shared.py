@@ -82,6 +82,15 @@ class Meta:
     # right account through `client.account` — they never saw the
     # original `POST /credentials/lease` response themselves.
     account: str | None = None
+    # Immutable server-side account id for this lease (surrogate PK). Persisted
+    # alongside `account` so a same-account check survives a rename, and so a
+    # holder promoted to leader after a health swap can re-sync to the CURRENT
+    # lease's identity from here rather than trusting its own stale cache.
+    account_id: int | None = None
+    # Current access_token expiry (epoch seconds) for the shared lease.
+    # Persisted so a promoted leader schedules its token poll off the CURRENT
+    # lease, not the one it originally joined (a health swap advances this).
+    token_expires_at: float = 0.0
 
     @classmethod
     def from_json(cls, d: dict) -> "Meta":
@@ -90,6 +99,8 @@ class Meta:
             holders=list(d.get("holders") or []),
             poll_leader=d.get("poll_leader"),
             account=d.get("account"),
+            account_id=d.get("account_id"),
+            token_expires_at=float(d.get("token_expires_at") or 0.0),
         )
 
     def to_json(self) -> dict:
@@ -98,6 +109,8 @@ class Meta:
             "holders": self.holders or [],
             "poll_leader": self.poll_leader,
             "account": self.account,
+            "account_id": self.account_id,
+            "token_expires_at": self.token_expires_at,
         }
 
 

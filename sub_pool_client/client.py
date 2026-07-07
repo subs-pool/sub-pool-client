@@ -38,6 +38,7 @@ Scale by adding accounts, not by cross-host sharing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -49,6 +50,7 @@ from typing import Any
 import httpx
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore
 
+from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
     cleanup_dir,
     dir_key,
@@ -59,6 +61,7 @@ from sub_pool_client._shared import (
 from sub_pool_client.errors import (
     PoolAuthError,
     PoolConnectionError,
+    PoolError,
     PoolUpstreamError,
 )
 
@@ -80,6 +83,7 @@ class PooledClient(ClaudeSDKClient):
         required_model: str | None = None,
         required_features: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        health_interval_s: float = 30.0,
     ):
         self._pool_url = (pool_url or os.environ.get("SUB_POOL_URL", "")).rstrip("/")
         self._api_key = api_key or os.environ.get("SUB_POOL_KEY", "")
@@ -92,6 +96,7 @@ class PooledClient(ClaudeSDKClient):
         self._request_id_req = request_id
         self._required_model = required_model
         self._required_features = list(required_features or [])
+        self._health_interval_s = health_interval_s
 
         # Caller-supplied options are never mutated; we copy to attach env.
         self._base_options = copy.copy(options) if options else ClaudeAgentOptions()
@@ -107,11 +112,18 @@ class PooledClient(ClaudeSDKClient):
         self._is_poll_leader = False       # we run the token poll task
         self._lease_id: str | None = None
         self._lease_account: str | None = None
+        self._lease_account_id: int | None = None
         self._lease_request_id: str | None = None
         self._token_expires_at: float = 0.0
         self._sdk_inited = False
         self._poll_task: asyncio.Task | None = None
+        self._health_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        # Set by a health swap to interrupt the poll loop's (possibly
+        # multi-hour) sleep so it reschedules against the NEW account's token
+        # expiry — otherwise a swap to a shorter-lived token could expire
+        # unnoticed mid-sleep.
+        self._poll_wake = asyncio.Event()
 
     # ============================================================ lifecycle
     async def __aenter__(self) -> "PooledClient":
@@ -137,15 +149,24 @@ class PooledClient(ClaudeSDKClient):
         await ClaudeSDKClient.__aenter__(self)
 
         if self._is_poll_leader:
-            self._poll_task = asyncio.create_task(self._poll_loop())
+            self._start_leader_tasks()
         # Every holder runs the heartbeat — cheap, and takes over
         # leadership if the current leader crashed.
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         return self
 
+    def _start_leader_tasks(self) -> None:
+        """The poll leader owns two background tasks: token rotation
+        (`_poll_loop`) and health-driven account swap (`_health_loop`).
+        Idempotent — a heartbeat promotion or re-entry won't double-spawn."""
+        if self._poll_task is None:
+            self._poll_task = asyncio.create_task(self._poll_loop())
+        if self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_loop())
+
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        for attr in ("_poll_task", "_heartbeat_task"):
+        for attr in ("_poll_task", "_health_task", "_heartbeat_task"):
             t = getattr(self, attr, None)
             if t is not None:
                 t.cancel()
@@ -173,9 +194,14 @@ class PooledClient(ClaudeSDKClient):
 
         async with locked_meta(self._dir) as meta:
             if meta.lease_id and meta.holders:
-                # Active lease already present — reuse it.
+                # Active lease already present — reuse it. Read identity +
+                # expiry from meta (the shared source of truth): a prior
+                # health swap may have advanced them past what any earlier
+                # holder saw, and we may be promoted to leader later.
                 self._lease_id = meta.lease_id
                 self._lease_account = meta.account
+                self._lease_account_id = meta.account_id
+                self._token_expires_at = meta.token_expires_at
                 # Always append (one entry per __aenter__, not per pid)
                 # so N `async with` in the same pid are refcounted by
                 # N removes on exit.
@@ -199,12 +225,15 @@ class PooledClient(ClaudeSDKClient):
             write_credentials(self._dir, bundle)
             self._lease_id = lease["lease_id"]
             self._lease_account = lease.get("account")
+            self._lease_account_id = lease.get("pool_account_id")
             self._lease_request_id = lease.get("request_id")
             self._token_expires_at = float(
                 bundle.get("expires_at") or lease.get("token_expires_at") or 0.0
             )
             meta.lease_id = self._lease_id
             meta.account = self._lease_account
+            meta.account_id = self._lease_account_id
+            meta.token_expires_at = self._token_expires_at
             meta.holders = [my_pid]
             meta.poll_leader = my_pid
             self._is_first_holder = True
@@ -228,8 +257,12 @@ class PooledClient(ClaudeSDKClient):
                     pass
             # If we were the poll leader, hand leadership off. The next
             # heartbeat in a surviving holder will elect itself and start
-            # its own poll_loop.
-            if meta.poll_leader == my_pid:
+            # its own poll_loop. Guard on self._is_poll_leader: with two
+            # instances in the SAME process (identical pid), a departing
+            # NON-leader must not clear the live leader's seat — that would
+            # trigger a spurious promotion and leave two leaders both running
+            # _swap_account.
+            if meta.poll_leader == my_pid and self._is_poll_leader:
                 meta.poll_leader = None
             if not meta.holders:
                 lease_id_to_release = meta.lease_id
@@ -244,9 +277,13 @@ class PooledClient(ClaudeSDKClient):
 
     # ============================================================ heartbeat
     async def _heartbeat_loop(self, interval_s: float = 30.0) -> None:
-        """Periodically re-checks meta.json for liveness of the current
-        poll leader. If the leader is gone (crashed / exited) this
-        holder promotes itself and starts its own poll_loop.
+        """Every tick a non-leader holder (a) re-syncs its cached lease state
+        from meta and (b) promotes itself if the poll leader is gone.
+
+        The re-sync is what keeps a non-leader honest after the leader
+        health-swaps the shared lease: without it `self._lease_id` (hence
+        `.account`, `report_error`, and a future promotion) would stay pinned to
+        a released old lease.
         """
         try:
             while True:
@@ -257,13 +294,21 @@ class PooledClient(ClaudeSDKClient):
                 my_pid = os.getpid()
                 promoted = False
                 async with locked_meta(self._dir) as meta:
+                    # Track the shared lease (a leader's health swap advances it
+                    # past our cache). Guard on non-None so we never clobber a
+                    # live cache with a torn/empty meta.
+                    if meta.lease_id is not None:
+                        self._lease_id = meta.lease_id
+                        self._lease_account = meta.account
+                        self._lease_account_id = meta.account_id
+                        self._token_expires_at = meta.token_expires_at
                     # locked_meta already cleared dead-leader pids.
                     if meta.poll_leader is None and my_pid in (meta.holders or []):
                         meta.poll_leader = my_pid
                         promoted = True
                 if promoted:
                     self._is_poll_leader = True
-                    self._poll_task = asyncio.create_task(self._poll_loop())
+                    self._start_leader_tasks()
                     log.info("heartbeat: promoted self to poll leader")
                     return   # heartbeat's job done
         except asyncio.CancelledError:
@@ -283,22 +328,47 @@ class PooledClient(ClaudeSDKClient):
         """
         try:
             while True:
+                self._poll_wake.clear()
                 remaining = self._token_expires_at - time.time()
                 # Wake up 10 min before expiry, minimum 60s sleep so we
                 # don't bash the pool during tiny-TTL tests.
                 sleep_s = max(60.0, remaining - 600.0)
-                await asyncio.sleep(sleep_s)
+                # Interruptible sleep: a health swap sets _poll_wake so we
+                # recompute the schedule against the NEW (possibly much shorter)
+                # token expiry instead of oversleeping on the old account's.
+                woke_early = True
+                try:
+                    await asyncio.wait_for(self._poll_wake.wait(), timeout=sleep_s)
+                except asyncio.TimeoutError:
+                    woke_early = False
+                if woke_early:
+                    # Swap advanced self._token_expires_at; reschedule, don't
+                    # burn a poll on the freshly-written token.
+                    continue
 
                 if self._dir is None or self._lease_id is None:
                     return
 
+                lease_id_before = self._lease_id
                 try:
                     new = await self._post_poll_token()
                 except Exception as e:  # noqa: BLE001
+                    # If a swap rotated us mid-poll, this failure is just the
+                    # OLD lease's 410 — don't clobber the new expiry the swap
+                    # already set (that would force a pointless refresh 60s on).
+                    if self._lease_id != lease_id_before:
+                        continue
                     log.warning("lease token poll failed: %s", e)
                     # Try again in 30s; a transient 5xx / network blip
                     # shouldn't tear down the agent.
                     self._token_expires_at = time.time() + 60.0
+                    continue
+
+                # A health-driven swap may have rotated us onto a different
+                # lease/account while this poll was in flight. The token we
+                # just fetched belongs to the OLD lease; writing it onto the
+                # NEW account's shared credentials file would clobber the swap.
+                if self._lease_id != lease_id_before:
                     continue
 
                 new_access = new.get("access_token")
@@ -337,12 +407,155 @@ class PooledClient(ClaudeSDKClient):
             )
         return r.json()
 
+    # ============================================================ health swap
+    async def _health_loop(self) -> None:
+        """Leader-only: watch the lease's account health and swap to a fresh
+        account when the pool marks the current one unhealthy — quota COOLING,
+        or INVALID after a revoked / auth-expired credential (see the server's
+        usage-probe recovery). Reuses the same `HealthWatcher` the `sp-claude`
+        CLI uses; the running `claude` subprocess re-reads `.credentials.json`
+        on its next request, so the swap is transparent to the caller.
+
+        This is what closes the "healthy-looking lease but its token is dead
+        upstream" gap: without it a PooledClient would 401 for the rest of the
+        session with no way to recover.
+        """
+        watcher = HealthWatcher(
+            fetch=self._fetch_health,
+            on_unhealthy=self._on_unhealthy,
+            interval_s=self._health_interval_s,
+        )
+        try:
+            await watcher.run()
+        except asyncio.CancelledError:
+            return
+
+    async def _fetch_health(self) -> dict:
+        lease_id = self._lease_id
+        if self._dir is None or lease_id is None:
+            return {"healthy": True}
+        r = await self._http.get(
+            f"{self._pool_url}/credentials/lease/{lease_id}/health",
+            headers={"authorization": f"Bearer {self._api_key}"},
+        )
+        # 404 (unknown lease) / 410 (lease ended) → HealthWatcher stops. Other
+        # non-2xx are logged + retried by the watcher.
+        r.raise_for_status()
+        return r.json()
+
+    async def _on_unhealthy(self, health: dict) -> None:
+        await self._swap_account(reason=str(health.get("reason") or "unhealthy"))
+
+    async def _swap_account(self, *, reason: str) -> None:
+        """Lease a replacement account and rewrite the shared credential in
+        place so the running CLI picks it up on its next request. Only the poll
+        leader runs this. Best-effort: if the pool has no other healthy account
+        (503) we keep the current lease and let the next health tick retry.
+        """
+        if self._dir is None or self._lease_id is None:
+            return
+        old_lease_id = self._lease_id
+        old_account = self._lease_account
+        old_account_id = self._lease_account_id
+        try:
+            # Do NOT reuse the caller's request_id here: the pool dedupes leases
+            # by request_id and would idempotently hand back the CURRENT
+            # (still-active, unhealthy) lease instead of a fresh account — the
+            # swap would silently no-op forever ("no other account" every tick).
+            lease = await self._post_lease(include_request_id=False)
+        except PoolError as e:
+            # 503 (all other accounts cooling/invalid) or a transient pool
+            # blip — don't tear down a working lease over it; retry next tick.
+            log.info("health swap deferred: new lease failed: %s", e)
+            return
+
+        bundle = lease.get("credentials") or {}
+        new_lease_id = lease.get("lease_id")
+        new_account = lease.get("account")
+        new_account_id = lease.get("pool_account_id")
+        if not bundle.get("access_token") or not new_lease_id:
+            log.warning("health swap: lease response missing bundle; keeping current")
+            await self._release_swap_dup(new_lease_id, old_lease_id)
+            return
+        # Same-account guard keys on the immutable server account_id, NOT the
+        # name: a delete+recreate of the same name is a DIFFERENT account and
+        # must be allowed to swap in. Only bail when the pool handed back the
+        # very same account (its only healthy candidate) — nothing to swap to.
+        same_account = (
+            new_lease_id == old_lease_id
+            or (new_account_id is not None and old_account_id is not None
+                and new_account_id == old_account_id)
+        )
+        if same_account:
+            await self._release_swap_dup(new_lease_id, old_lease_id)
+            log.info("health swap: no other account available (still on %s)",
+                     old_account)
+            return
+
+        new_exp = float(
+            bundle.get("expires_at") or lease.get("token_expires_at") or 0.0
+        )
+        # Commit under the meta lock so the poll loop's post-await lease_id
+        # re-check sees the rotation and drops any stale token patch. No await
+        # between the disk write and the meta / self advance.
+        #
+        # `committed` marks the point where the NEW lease becomes ours: the
+        # instant on-disk creds AND in-memory state point at it — set BEFORE the
+        # `async with` exit persists meta.json. If that persist fails (ENOSPC),
+        # committed is already True so the finally does NOT delete the new lease:
+        # self._lease_id / .credentials.json already use it, and deleting it
+        # would strand us on a dead lease (health 410 → no self-heal — the exact
+        # state this feature removes). meta.json just stays stale (old id) and
+        # self-corrects on the next locked_meta write; the now-unreferenced OLD
+        # lease is reaped by TTL.
+        committed = False
+        try:
+            async with locked_meta(self._dir) as meta:
+                write_credentials(self._dir, bundle)
+                meta.lease_id = new_lease_id
+                meta.account = new_account
+                meta.account_id = new_account_id
+                meta.token_expires_at = new_exp
+                self._lease_id = new_lease_id
+                self._lease_account = new_account
+                self._lease_account_id = new_account_id
+                self._lease_request_id = lease.get("request_id")
+                self._token_expires_at = new_exp
+                # Wake the poll loop to reschedule against the new expiry, and
+                # take ownership — both inside the lock so a failed meta persist
+                # still leaves us pointing at a live lease.
+                self._poll_wake.set()
+                committed = True
+        finally:
+            if not committed:
+                # Never took ownership → release the orphaned new lease so it
+                # isn't leaked to the reaper. Shield so an in-flight cancel
+                # can't skip the cleanup.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(self._delete_lease(new_lease_id, None))
+
+        # Release the cooled / dead lease. Shielded + best-effort so a
+        # concurrent __aexit__ cancel can't leak it. (Skipped if the meta
+        # persist above threw — the old lease then falls to the reaper.)
+        with contextlib.suppress(Exception):
+            await asyncio.shield(self._delete_lease(old_lease_id, None))
+        log.info("health-swapped account %s → %s (lease %s → %s; reason: %s)",
+                 old_account, new_account, old_lease_id, new_lease_id, reason[:80])
+
+    async def _release_swap_dup(self, new_lease_id, old_lease_id) -> None:
+        """Release a just-acquired lease we decided not to keep (missing bundle
+        or same-account), so a deferred swap never leaks it. Shielded so an
+        __aexit__ cancel landing on the DELETE can't skip the cleanup."""
+        if new_lease_id and new_lease_id != old_lease_id:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._delete_lease(new_lease_id, None))
+
     # ============================================================ HTTP
-    async def _post_lease(self) -> dict:
+    async def _post_lease(self, *, include_request_id: bool = True) -> dict:
         body: dict[str, Any] = {"provider": "claude"}
         if self._user_id:
             body["user_id"] = self._user_id
-        if self._request_id_req:
+        if include_request_id and self._request_id_req:
             body["request_id"] = self._request_id_req
         if self._required_model:
             body["required_model"] = self._required_model
@@ -396,11 +609,12 @@ class PooledClient(ClaudeSDKClient):
         alive — caller decides whether to keep using it or tear down
         and re-lease on a different account.
         """
-        if self._lease_id is None:
+        lease_id = await self._current_lease_id()
+        if lease_id is None:
             return {}
         try:
             r = await self._http.post(
-                f"{self._pool_url}/credentials/lease/{self._lease_id}/report-error",
+                f"{self._pool_url}/credentials/lease/{lease_id}/report-error",
                 headers={"authorization": f"Bearer {self._api_key}"},
                 json={"code": code, "message": message},
             )
@@ -411,6 +625,19 @@ class PooledClient(ClaudeSDKClient):
             log.warning("report_error %s: %s", r.status_code, r.text[:200])
             return {}
         return r.json()
+
+    async def _current_lease_id(self) -> str | None:
+        """The lease id to act on right now. Prefers the shared meta over our
+        cached `self._lease_id`: a leader's health swap may have rotated the
+        lease past a non-leader holder's cache, and acting on the released old
+        lease would 410 (report_error) or misroute — so callers that reach the
+        pool by lease id resolve through here."""
+        if self._dir is not None:
+            with contextlib.suppress(Exception):
+                async with locked_meta(self._dir) as meta:
+                    if meta.lease_id is not None:
+                        return meta.lease_id
+        return self._lease_id
 
     # ============================================================ introspection
     @property
