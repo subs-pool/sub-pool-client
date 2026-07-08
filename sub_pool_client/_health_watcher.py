@@ -45,13 +45,39 @@ class HealthWatcher:
             try:
                 data = await self._fetch()
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 410:
-                    # Lease ended out from under us (someone called
-                    # DELETE, or a prior swap obsoleted us). Stop.
-                    return
-                if e.response.status_code == 404:
-                    # Wrong key / unknown lease — same disposition.
-                    return
+                if e.response.status_code in (404, 410):
+                    # Our CURRENT lease died server-side while the session is
+                    # still live: reaped after a health-poll gap (e.g. the host
+                    # slept past LEASE_TTL_S), externally released, or the
+                    # account deleted. Giving up here is what left a long
+                    # session 401ing forever with no recovery. Instead recover
+                    # through the same swap handler — it re-leases a fresh
+                    # account (releasing the dead one is best-effort) — then
+                    # keep watching the new lease. `lease_gone` tells the
+                    # handler this is a re-lease, so a same-account replacement
+                    # (new lease_id) is still adopted rather than discarded as
+                    # "nothing to swap to".
+                    #
+                    # Operator note: because of this, a bare DELETE of the lease
+                    # no longer evicts a live client — it re-leases within one
+                    # tick (possibly onto the same account). To take an account
+                    # out from under a running session, DISABLE the account
+                    # (re-lease then 503s and the client quietly waits it out) or
+                    # revoke its api-key.
+                    try:
+                        await self._on_unhealthy({
+                            "healthy": False,
+                            "state": "gone",
+                            "lease_gone": True,
+                            "reason": f"lease gone ({e.response.status_code}); "
+                                      f"re-leasing",
+                        })
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as ex:  # noqa: BLE001
+                        log.warning("re-lease after %s raised: %s",
+                                    e.response.status_code, ex)
+                    continue
                 # Other 4xx/5xx — log and keep going.
                 log.debug("health probe http error: %s", e)
                 continue

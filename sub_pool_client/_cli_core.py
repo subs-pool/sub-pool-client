@@ -16,6 +16,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -428,6 +429,11 @@ async def run_session(
 
             # Background tasks: token refresh + health-driven account swap.
             current = {"lease": lease}
+            # Set by a successful swap so the expiry-anchored refresh loop
+            # re-anchors to the NEW lease's token instead of sleeping out a
+            # now-stale deadline — a swapped-in token may have far less life
+            # left than the one it replaced.
+            refresh_wake = asyncio.Event()
 
             async def on_swap_needed(health: dict) -> None:
                 # Read the from-account BEFORE swap_credentials runs —
@@ -439,6 +445,10 @@ async def run_session(
                         pool, current, session_dir, provider,
                         account=chosen_account,
                     )
+                    # swap_credentials already advanced current["lease"]
+                    # (incl. token_expires_at) in its sync block; wake the
+                    # refresh loop so it re-anchors to the new expiry.
+                    refresh_wake.set()
                     if verbose:
                         log.info(
                             "swapped %s → %s (reason: %s)",
@@ -450,7 +460,10 @@ async def run_session(
                         log.info("swap deferred: %s", e)
 
             refresher = asyncio.create_task(
-                _token_refresh_loop(pool, current, session_dir, provider, verbose),
+                _token_refresh_loop(
+                    pool, current, session_dir, provider, verbose,
+                    wake=refresh_wake,
+                ),
                 name=f"sp-{provider.name}-refresh",
             )
             watcher = asyncio.create_task(
@@ -520,15 +533,63 @@ async def _refresh_once(
 async def _token_refresh_loop(
     pool: PoolHTTP, current: dict, session_dir: Path,
     provider: CliProvider, verbose: bool,
-    *, interval_s: float = 50 * 60,
+    *, wake: "asyncio.Event | None" = None,
+    slack_s: float = 600.0, min_sleep_s: float = 60.0,
+    fallback_s: float = 50 * 60,
 ) -> None:
-    """Periodically rotate access_token via the pool. Same cadence as
-    PooledClient. See `_refresh_once` for the race-safety guard."""
+    """Rotate access_token via the pool BEFORE it expires.
+
+    Anthropic access tokens live only ~1h and the leased bundle is
+    sanitized (refreshToken=""), so the spawned CLI can't self-refresh —
+    the pool is the sole refresher, and the running `claude` re-reads the
+    rewritten .credentials.json across requests (see _swap.py).
+
+    The catch that broke this: a leased token is NOT freshly minted. The
+    pool only re-mints at seal time when under `slack_s` of life remains,
+    so a lease can hand out a token with as little as ~10min left. The old
+    fixed 50-min cadence therefore fired long AFTER such a token had
+    already died mid-session → an unrecoverable 401 (the exact failure
+    users hit). So anchor every sleep to the token's ACTUAL expiry
+    (mirrors PooledClient._poll_loop), and let a swap wake us to re-anchor
+    against the replacement token — which may itself be short-lived.
+
+    See `_refresh_once` for the concurrent-swap race-safety guard.
+    """
+    if wake is None:
+        wake = asyncio.Event()  # never set → wait_for always times out
     while True:
+        exp = float(current["lease"].get("token_expires_at") or 0.0)
+        if exp <= 0:
+            # No usable expiry (e.g. a codex api-key lease / an exp-less JWT
+            # → the pool reports token_expires_at=0). We can't anchor, so
+            # fall back to the old fixed cadence instead of hammering /token
+            # every min_sleep_s (which anchoring-to-a-past-deadline would do).
+            sleep_s = fallback_s
+        else:
+            # A refresh that FAILS leaves exp near-now, so max()-clamping to
+            # min_sleep_s makes us retry every min_sleep_s until it lands —
+            # or the token dies, at which point a genuinely-dead refresh_token
+            # has already flipped the account INVALID and the health watcher
+            # swaps us off it.
+            sleep_s = max(min_sleep_s, exp - time.time() - slack_s)
         try:
-            await asyncio.sleep(interval_s)
+            await asyncio.wait_for(wake.wait(), timeout=sleep_s)
+        except asyncio.TimeoutError:
+            # A swap can land in the same tick the deadline fires (set the
+            # wake just after wait_for times out); honor it so we re-anchor
+            # to the swapped-in token rather than refreshing a lease the swap
+            # already wrote fresh credentials for.
+            if wake.is_set():
+                wake.clear()
+                continue
         except asyncio.CancelledError:
             return
+        else:
+            # Woken by a swap: current["lease"] already points at the new
+            # token (written by swap_credentials); re-anchor without
+            # refreshing, since the swap installed fresh credentials.
+            wake.clear()
+            continue
         await _refresh_once(pool, current, session_dir, provider, verbose)
 
 

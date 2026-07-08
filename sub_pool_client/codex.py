@@ -439,14 +439,18 @@ class PooledCodexClient:
             f"{self._pool_url}/credentials/lease/{lease_id}/health",
             headers={"authorization": f"Bearer {self._api_key}"},
         )
-        # 404 (unknown lease) / 410 (lease ended) → HealthWatcher stops.
+        # 404 (unknown lease) / 410 (lease ended) → HealthWatcher recovers by
+        # re-leasing (lease_gone). Other non-2xx are logged + retried.
         r.raise_for_status()
         return r.json()
 
     async def _on_unhealthy(self, health: dict) -> None:
-        await self._swap_account(reason=str(health.get("reason") or "unhealthy"))
+        await self._swap_account(
+            reason=str(health.get("reason") or "unhealthy"),
+            lease_gone=bool(health.get("lease_gone")),
+        )
 
-    async def _swap_account(self, *, reason: str) -> None:
+    async def _swap_account(self, *, reason: str, lease_gone: bool = False) -> None:
         """Lease a replacement Codex account and rewrite the shared auth.json
         in place so the running CLI picks it up on its next call. Only the poll
         leader runs this. Best-effort: no other healthy account (503) → keep the
@@ -477,13 +481,17 @@ class PooledCodexClient:
             return
         # Same-account guard keys on the immutable server account_id, NOT the
         # name (a delete+recreate of the same name is a DIFFERENT account and
-        # must swap in).
+        # must swap in). For a cooled swap the same account means "nothing to
+        # swap to" — keep the current lease. But when the lease is GONE
+        # (lease_gone, 410/404), the same account on a NEW lease_id IS the
+        # recovery; only a byte-identical lease_id is truly nothing gained.
+        same_lease = new_lease_id == old_lease_id
         same_account = (
-            new_lease_id == old_lease_id
+            same_lease
             or (new_account_id is not None and old_account_id is not None
                 and new_account_id == old_account_id)
         )
-        if same_account:
+        if same_lease or (same_account and not lease_gone):
             await self._release_swap_dup(new_lease_id, old_lease_id)
             log.info("codex health swap: no other account available (still on %s)",
                      old_account)
