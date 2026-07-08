@@ -55,6 +55,7 @@ from sub_pool_client._shared import (
     cleanup_dir,
     dir_key,
     locked_meta,
+    next_refresh_sleep,
     shared_dir,
     write_credentials,
 )
@@ -329,10 +330,10 @@ class PooledClient(ClaudeSDKClient):
         try:
             while True:
                 self._poll_wake.clear()
-                remaining = self._token_expires_at - time.time()
-                # Wake up 10 min before expiry, minimum 60s sleep so we
-                # don't bash the pool during tiny-TTL tests.
-                sleep_s = max(60.0, remaining - 600.0)
+                # Wake ~10 min before expiry (min 60s), or a fixed cadence when
+                # the lease has no usable expiry — shared with the CLI + codex
+                # so the three schedulers can't drift (see next_refresh_sleep).
+                sleep_s = next_refresh_sleep(self._token_expires_at, time.time())
                 # Interruptible sleep: a health swap sets _poll_wake so we
                 # recompute the schedule against the NEW (possibly much shorter)
                 # token expiry instead of oversleeping on the old account's.

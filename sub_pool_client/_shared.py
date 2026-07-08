@@ -41,6 +41,36 @@ DEFAULT_ROOT = Path(
 )
 
 
+# ---- token-refresh scheduling -------------------------------------------
+# Shared by the sp-claude/sp-codex CLI refresh loop (_cli_core) AND both SDK
+# poll loops (PooledClient / PooledCodexClient). Kept in ONE place because the
+# three drifted apart twice: the CLI once regressed to a fixed cadence that
+# outlived short-lived tokens (→ mid-session 401), and the exp<=0 fallback below
+# once existed only in the CLI (→ codex api-key SDK leases polling every 60s).
+POLL_SLACK_S = 600.0        # refresh this long BEFORE the token actually expires
+POLL_MIN_SLEEP_S = 60.0     # floor so tiny-TTL tests / churn don't bash the pool
+POLL_FALLBACK_S = 50 * 60.0  # no usable expiry (token_expires_at<=0, e.g. a codex
+                             # api-key lease / an exp-less JWT) → fixed cadence
+
+
+def next_refresh_sleep(
+    expires_at: float, now: float, *,
+    slack_s: float = POLL_SLACK_S,
+    min_sleep_s: float = POLL_MIN_SLEEP_S,
+    fallback_s: float = POLL_FALLBACK_S,
+) -> float:
+    """Seconds to sleep before the next pool token refresh.
+
+    Anchored to the token's ACTUAL expiry: wake `slack_s` before it, floored at
+    `min_sleep_s`. When `expires_at` carries no usable value (<=0), fall back to
+    a fixed cadence instead of anchoring to a long-past deadline — that would
+    refresh every `min_sleep_s` forever (a needless churn storm that hit codex
+    api-key leases, whose token has no expiry)."""
+    if expires_at <= 0:
+        return fallback_s
+    return max(min_sleep_s, expires_at - now - slack_s)
+
+
 def dir_key(
     *,
     pool_url: str,

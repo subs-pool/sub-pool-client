@@ -26,6 +26,7 @@ import httpx
 
 from sub_pool_client._cli_provider import CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
+from sub_pool_client._shared import next_refresh_sleep
 from sub_pool_client._swap import NoSwapAvailable, swap_credentials
 
 
@@ -559,19 +560,16 @@ async def _token_refresh_loop(
         wake = asyncio.Event()  # never set → wait_for always times out
     while True:
         exp = float(current["lease"].get("token_expires_at") or 0.0)
-        if exp <= 0:
-            # No usable expiry (e.g. a codex api-key lease / an exp-less JWT
-            # → the pool reports token_expires_at=0). We can't anchor, so
-            # fall back to the old fixed cadence instead of hammering /token
-            # every min_sleep_s (which anchoring-to-a-past-deadline would do).
-            sleep_s = fallback_s
-        else:
-            # A refresh that FAILS leaves exp near-now, so max()-clamping to
-            # min_sleep_s makes us retry every min_sleep_s until it lands —
-            # or the token dies, at which point a genuinely-dead refresh_token
-            # has already flipped the account INVALID and the health watcher
-            # swaps us off it.
-            sleep_s = max(min_sleep_s, exp - time.time() - slack_s)
+        # Shared with both SDK poll loops (see _shared.next_refresh_sleep) so the
+        # three schedulers can't drift again. A refresh that FAILS leaves exp
+        # near-now, so the min_sleep_s floor makes us retry every min_sleep_s
+        # until it lands — or the token dies, at which point a genuinely-dead
+        # refresh_token has already flipped the account INVALID and the health
+        # watcher swaps us off it.
+        sleep_s = next_refresh_sleep(
+            exp, time.time(),
+            slack_s=slack_s, min_sleep_s=min_sleep_s, fallback_s=fallback_s,
+        )
         try:
             await asyncio.wait_for(wake.wait(), timeout=sleep_s)
         except asyncio.TimeoutError:

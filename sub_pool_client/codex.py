@@ -32,6 +32,7 @@ from sub_pool_client._shared import (
     cleanup_dir,
     dir_key,
     locked_meta,
+    next_refresh_sleep,
     shared_dir,
     write_codex_auth,
 )
@@ -338,9 +339,11 @@ class PooledCodexClient:
         try:
             while True:
                 self._poll_wake.clear()
-                remaining = self._token_expires_at - time.time()
-                # Wake up 10 min before expiry, minimum 60s sleep.
-                sleep_s = max(60.0, remaining - 600.0)
+                # Wake ~10 min before expiry (min 60s), or a fixed cadence when
+                # the lease has no usable expiry (codex api-key tokens have none)
+                # — shared with the CLI + claude SDK so the three schedulers
+                # can't drift (see next_refresh_sleep).
+                sleep_s = next_refresh_sleep(self._token_expires_at, time.time())
                 # Interruptible: a health swap sets _poll_wake so we reschedule
                 # against the NEW account's token expiry instead of oversleeping
                 # on the old one (Codex tokens can be days out).
