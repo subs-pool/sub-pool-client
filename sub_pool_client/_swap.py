@@ -45,7 +45,7 @@ class NoSwapAvailable(Exception):
 async def swap_credentials(
     pool: "PoolHTTP", current: dict, session_dir: Path,
     provider: "CliProvider",
-    *, account: str | None = None,
+    *, account: str | None = None, required_model: str | None = None,
 ) -> dict:
     """Replace the lease backing `session_dir` with a fresh one.
 
@@ -70,7 +70,12 @@ async def swap_credentials(
     """
     old_lease_id = current["lease"]["lease_id"]
     try:
-        new_lease = await pool.lease(provider, account=account)
+        # Carry the session's model into the replacement lease too — swapping
+        # onto an account whose sub-cap for that model is spent would just
+        # trade one 429 for the next.
+        new_lease = await pool.lease(
+            provider, account=account, required_model=required_model,
+        )
     except httpx.HTTPStatusError as e:
         # 503 = strategy says no candidate (all cooling / invalid).
         # Anything else: surface as no-swap-available so the watcher

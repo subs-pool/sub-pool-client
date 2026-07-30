@@ -323,12 +323,15 @@ class PoolHTTP:
 
     async def lease(self, provider: CliProvider, *,
                     account: str | None = None,
-                    user_id: str | None = None) -> dict:
+                    user_id: str | None = None,
+                    required_model: str | None = None) -> dict:
         body: dict[str, Any] = dict(provider.lease_body_extras)
         if account:
             body["account"] = account
         if user_id:
             body["user_id"] = user_id
+        if required_model:
+            body["required_model"] = required_model
         r = await self._client.post("/credentials/lease", json=body)
         r.raise_for_status()
         return r.json()
@@ -351,6 +354,124 @@ class PoolHTTP:
 
 
 # ============================================================ session main
+
+
+# `claude` flags we know take no value, so a `--model` following one is a
+# real flag rather than that option's argument. Deliberately a small
+# allow-list of switches people actually combine with --model, NOT an
+# attempt to mirror claude's option table: an entry going stale only costs
+# us a detection (safe), while a missing entry costs nothing at all.
+_CLAUDE_VALUELESS_FLAGS = frozenset({
+    "-p", "--print", "-c", "--continue", "-r", "--resume",
+    "--verbose", "--debug", "--dangerously-skip-permissions",
+    "--no-color", "--strict-mcp-config", "--include-partial-messages",
+    "--replay-user-messages", "--fork-session", "--help", "-h",
+    "--version", "-v",
+})
+
+
+# `--model` values that SELECT a model rather than naming one. Verified
+# against claude 2.1.220: `default` resolves to whatever the user configured,
+# `best` and `opusplan` are routing modes (observed running opus-5 and
+# sonnet-5 respectively), `inherit` defers to the parent session.
+#
+# Short names like `sonnet` / `opus` / `fable` are NOT here — those do name a
+# model, and they match upstream's sub-cap display names directly.
+#
+# Read off one binary version, so it will drift. That's tolerable in one
+# direction only: a missing alias means we forward a string no model is
+# called, the pool matches nothing, and the lease goes unfiltered — the same
+# safe outcome as any other miss. It would only bite if a future alias
+# happened to equal the slug of a model that has a sub-cap.
+_CLAUDE_MODEL_ALIASES = frozenset({
+    "default", "best", "inherit", "opusplan", "opus-plan", "sonnet-plan",
+    "builtindefault",
+})
+
+
+def _consumes_a_value(token: str) -> bool:
+    """Could `token` swallow whatever comes after it?
+
+    Unknown flags answer True — that's the conservative side. A flag written
+    with `=` carries its own value and cannot consume the next token, and a
+    non-flag (prompt text, a previous option's value) never could.
+    """
+    if not token.startswith("-"):
+        return False
+    if "=" in token:
+        return False
+    return token not in _CLAUDE_VALUELESS_FLAGS
+
+
+def model_from_args(args: tuple[str, ...]) -> str | None:
+    """Read the model out of the passthrough args, if we can be SURE of it.
+
+    Read-only: the flag is still forwarded to the upstream CLI untouched, so
+    this can't change what the binary does. The pool wants it because some
+    models carry their own weekly sub-cap, and a lease issued without knowing
+    the model can land on an account whose cap is already spent.
+
+    This is NOT a reimplementation of `claude`'s argument parser. We don't
+    have its full option table, so some inputs are genuinely ambiguous — and
+    the two ways of being wrong are not equally bad:
+
+      - MISS a model  -> the lease isn't filtered, so a spent account can be
+        handed out and 429. That is the behaviour that predates this feature,
+        and it self-corrects.
+      - INVENT a model -> the lease is filtered by something the user never
+        asked for, which can exclude every healthy account and turn a working
+        request into a 503.
+
+    So ambiguity resolves to None:
+
+      - scanning stops at `--`; everything after it is prompt text;
+      - a `--model` (either spelling) whose preceding token might consume it
+        is skipped — `--append-system-prompt --model=x` means `x` is that
+        option's value, not a model;
+      - a value starting with `-` is declined. `claude` would take it; this
+        is a deliberate miss on a shape nobody writes;
+      - alias values (`default`, `opusplan`, `inherit`) are declined: they
+        select a model rather than naming one, so passing them on would have
+        the pool match against a string no model is called.
+
+    Last occurrence wins, matching how a CLI resolves a repeated flag.
+    """
+    found: str | None = None
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        is_eq = a.startswith("--model=")
+        if not is_eq and a != "--model":
+            continue
+        # Same guard for both spellings. Applying it only to the bare form
+        # let `--append-system-prompt --model=not-a-model` invent a model —
+        # the unsafe direction this function exists to avoid.
+        if i > 0 and _consumes_a_value(args[i - 1]):
+            found = None
+            continue
+        if is_eq:
+            found = _real_model(a[len("--model="):])
+            continue
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        found = _real_model(nxt) if (nxt and not nxt.startswith("-")) else None
+    return found
+
+
+def _real_model(value: str | None) -> str | None:
+    """The value, unless it's an alias that selects rather than names.
+
+    `[1m]` / `[2m]` are context-length suffixes that attach to a model name OR
+    an alias — `best[1m]` runs opus-5 exactly as `best` does. The suffix is
+    stripped before the alias lookup, or an exact-match check waves it
+    through. The suffix is KEPT on the returned value: it's part of what the
+    user asked for, and the pool's slug matching handles `sonnet[1m]` against
+    a `Sonnet` cap by segment containment.
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    base = v.split("[", 1)[0].strip().lower()
+    return None if base in _CLAUDE_MODEL_ALIASES else v
 
 
 async def run_session(
@@ -377,12 +498,17 @@ async def run_session(
     chosen_account = account or cfg.default_account_for(provider)
     home_dir = SP_ROOT / provider.home_subdir
     user_id = os.environ.get("USER") or os.environ.get("USERNAME")
+    # Declared once at startup: a lease is model-stable in practice, and the
+    # upstream CLI's own `/model` switch mid-session is out of scope (the pool
+    # would need a re-lease to act on it anyway).
+    required_model = model_from_args(prompt_args)
 
     pool = PoolHTTP(cfg)
     try:
         try:
             lease = await pool.lease(
                 provider, account=chosen_account, user_id=user_id,
+                required_model=required_model,
             )
         except httpx.HTTPStatusError as e:
             click.echo(_describe_http_error(e, "lease"), err=True)
@@ -445,6 +571,7 @@ async def run_session(
                     new = await swap_credentials(
                         pool, current, session_dir, provider,
                         account=chosen_account,
+                        required_model=required_model,
                     )
                     # swap_credentials already advanced current["lease"]
                     # (incl. token_expires_at) in its sync block; wake the

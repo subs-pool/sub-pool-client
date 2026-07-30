@@ -12,6 +12,19 @@ Setup / introspection:
     sp-claude --claude-bin /path # override `claude` binary location
     sp-claude --verbose          # print swap / refresh events to stderr
 
+Unrecognised arguments pass straight through to `claude`, so anything
+the upstream CLI accepts works here unchanged. One of them is also
+*read* on the way past: `--model` is forwarded to the pool as the
+lease's `required_model`, so accounts whose weekly sub-cap for that
+model is already spent get skipped at pick time instead of handing you
+an immediate 429. The flag still reaches `claude` untouched.
+
+That read is conservative, not a second argument parser: where the
+model can't be determined without knowing claude's option table — after
+a `--`, or when `--model` might be the value of the flag before it —
+nothing is declared and the lease goes unfiltered, which is simply the
+behaviour from before this existed.
+
 While the session is alive the credentials file in `CLAUDE_CONFIG_DIR`
 is kept current — token rotations and mid-session account swaps
 happen transparently in the background.
