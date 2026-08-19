@@ -17,6 +17,7 @@ Repository = "https://github.com/subs-pool/sub-pool-client"
 [project.scripts]
 sp-claude = "sub_pool_client.cli_claude:main"
 sp-codex = "sub_pool_client.cli_codex:main"
+sp-grok = "sub_pool_client.cli_grok:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
