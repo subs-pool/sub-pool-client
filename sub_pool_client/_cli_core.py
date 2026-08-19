@@ -662,7 +662,7 @@ async def _token_refresh_loop(
     pool: PoolHTTP, current: dict, session_dir: Path,
     provider: CliProvider, verbose: bool,
     *, wake: "asyncio.Event | None" = None,
-    slack_s: float = 600.0, min_sleep_s: float = 60.0,
+    slack_s: float | None = None, min_sleep_s: float = 60.0,
     fallback_s: float = 50 * 60,
 ) -> None:
     """Rotate access_token via the pool BEFORE it expires.
@@ -695,7 +695,8 @@ async def _token_refresh_loop(
         # watcher swaps us off it.
         sleep_s = next_refresh_sleep(
             exp, time.time(),
-            slack_s=slack_s, min_sleep_s=min_sleep_s, fallback_s=fallback_s,
+            slack_s=(provider.refresh_slack_s if slack_s is None else slack_s),
+            min_sleep_s=min_sleep_s, fallback_s=fallback_s,
         )
         try:
             await asyncio.wait_for(wake.wait(), timeout=sleep_s)

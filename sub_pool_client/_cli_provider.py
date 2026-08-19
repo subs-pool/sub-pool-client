@@ -1,4 +1,4 @@
-"""Per-provider knobs for the sp-claude / sp-codex CLIs.
+"""Per-provider knobs for the sp-claude / sp-codex / sp-grok CLIs.
 
 The lease loop in `_cli_core` is provider-agnostic — same lease /
 refresh / release flow regardless of which upstream CLI gets spawned.
@@ -39,6 +39,24 @@ def _write_claude_credentials(path: Path, lease: dict) -> None:
         },
     }
     _atomic_write_json(path, payload)
+
+
+def _write_grok_auth(path: Path, lease: dict) -> None:
+    """Write the leased `auth.json` for the `grok` CLI.
+
+    Same deal as codex — the pool already stripped `refresh_token`, so this
+    just persists the sanitized bundle to `$GROK_HOME/auth.json`. Note the
+    payload keys are grok-build's own: the access token is `key`, and expiry
+    is `expires_at` as an RFC3339 string. Neither is rewritten here; the pool
+    is the only thing that mints them.
+    """
+    creds = lease.get("credentials") or {}
+    auth = creds.get("auth_json")
+    if not isinstance(auth, dict):
+        raise RuntimeError(
+            "lease response did not include a Grok auth_json bundle"
+        )
+    _atomic_write_json(path, auth)
 
 
 def _write_codex_auth(path: Path, lease: dict) -> None:
@@ -128,6 +146,13 @@ class CliProvider:
     # Pluggable credential writer — kept on the provider so the engine
     # never has to switch on `name`.
     write_credentials: Callable[[Path, dict], None]
+    # How long before expiry the pool re-mints this provider's token. The
+    # default suits a CLI that keeps working on a nearly-expired token; raise
+    # it for one that stops early. grok refuses to run once its token is
+    # within GROK_AUTH_EARLY_INVALIDATION_SECS (300s) of expiry — and since
+    # the leased copy has no refresh_token, it can't self-heal, it just
+    # reports "not authenticated". Verified against grok 1.0.5.
+    refresh_slack_s: float = 600.0
     # Optional first-run hook called on the persistent home dir before
     # symlinks get laid down. Used by Claude to seed a no-onboarding
     # `.claude.json`; Codex doesn't need it.
@@ -165,9 +190,33 @@ CODEX = CliProvider(
 )
 
 
+GROK = CliProvider(
+    name="grok",
+    default_bin="grok",
+    config_dir_env="GROK_HOME",
+    cred_filename="auth.json",
+    cred_skip_prefixes=("auth.json",),
+    home_subdir="grok-home",
+    # An ambient XAI_API_KEY makes grok skip the leased auth.json entirely and
+    # bill the pay-per-token API instead of the subscription we leased.
+    bypass_env_vars=("XAI_API_KEY",),
+    lease_body_extras={"provider": "grok"},
+    write_credentials=_write_grok_auth,
+    # 30 min, six times grok's own 300s cut-off. Its tokens live 6h, so this
+    # still means one rotation per session at most — cheap insurance against
+    # a late or briefly-failing refresh dropping the CLI into a login prompt
+    # it cannot complete.
+    refresh_slack_s=1800.0,
+)
+
+
+_PROVIDERS = {p.name: p for p in (CLAUDE, CODEX, GROK)}
+
+
 def get_provider(name: str) -> CliProvider:
-    if name == "claude":
-        return CLAUDE
-    if name == "codex":
-        return CODEX
-    raise ValueError(f"unknown provider {name!r}")
+    try:
+        return _PROVIDERS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown provider {name!r} (known: {', '.join(sorted(_PROVIDERS))})"
+        ) from None
