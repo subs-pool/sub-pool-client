@@ -24,6 +24,7 @@ from typing import Any
 import click
 import httpx
 
+from sub_pool_client import _auth_watch
 from sub_pool_client._cli_provider import CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import next_refresh_sleep
@@ -352,6 +353,25 @@ class PoolHTTP:
         r.raise_for_status()
         return r.json()
 
+    async def report_error(self, lease_id: str, code: str, message: str) -> None:
+        """Tell the pool the leased credential was rejected upstream.
+
+        The pool cools the account (never INVALID — see
+        `AccountRegistry.classify_error`, which refuses to let a consumer
+        report sticky-park a shared account), so parallel leases route
+        elsewhere and, critically, so OUR next lease request does not get
+        handed the same account straight back.
+
+        Best-effort by construction: this is an advisory signal on a
+        recovery path, and failing to deliver it must not stop the swap
+        that follows.
+        """
+        with suppress(Exception):
+            await self._client.post(
+                f"/credentials/lease/{lease_id}/report-error",
+                json={"code": code, "message": message},
+            )
+
 
 # ============================================================ session main
 
@@ -536,8 +556,16 @@ async def run_session(
             for k in provider.bypass_env_vars:
                 env.pop(k, None)
 
+            # Watching the child's output is what catches an upstream auth
+            # failure the pool cannot see (a revoked access token on a
+            # still-valid grant — see _auth_watch). It requires piping, so it
+            # is off whenever stdout is a real terminal: interactive `claude`
+            # is a TUI that needs one. stdin is always inherited.
+            watch_output = _auth_watch.should_watch()
+            _pipe = asyncio.subprocess.PIPE if watch_output else None
             proc = await asyncio.create_subprocess_exec(
                 bin_path, *prompt_args, env=env,
+                stdout=_pipe, stderr=_pipe,
             )
 
             # Forward common signals so Ctrl-C reaches the child. Record
@@ -562,10 +590,31 @@ async def run_session(
             # left than the one it replaced.
             refresh_wake = asyncio.Event()
 
+            # Serializes the two swap callers. The health watcher used to be
+            # the only one, so a plain await was enough; the auth ladder is a
+            # second, and its escalation path *causes* a health-visible
+            # failure (report-error cools the account), so the two can fire
+            # on the same incident. Concurrently, both would read the same
+            # `old_lease_id`, lease a replacement each, and the loser's lease
+            # would leak — held by the pool with nothing left pointing at it.
+            swap_lock = asyncio.Lock()
+
             async def on_swap_needed(health: dict) -> None:
                 # Read the from-account BEFORE swap_credentials runs —
                 # the call mutates `current["lease"]` in place (that's
                 # what closes the refresh/swap race; see _swap.py).
+                seen_lease_id = current["lease"]["lease_id"]
+                async with swap_lock:
+                    if current["lease"]["lease_id"] != seen_lease_id:
+                        # Someone swapped while we waited: whatever we were
+                        # reacting to is about a lease we are no longer on.
+                        if verbose:
+                            log.info("swap skipped: already moved off %s",
+                                     seen_lease_id)
+                        return
+                    await _do_swap(health)
+
+            async def _do_swap(health: dict) -> None:
                 old_account = current["lease"].get("account")
                 try:
                     new = await swap_credentials(
@@ -602,15 +651,87 @@ async def run_session(
                 name=f"sp-{provider.name}-health",
             )
 
+            # Output-driven auth recovery. Detection runs in the pumps (sync,
+            # non-blocking); the ACTION runs in one consumer task fed by a
+            # size-1 queue, so a burst of auth errors — which is what a dead
+            # token actually produces — collapses into a single ladder step
+            # instead of spawning a task per line.
+            aux: list[asyncio.Task] = []
+            pumps: list[asyncio.Task] = []
+            if watch_output:
+                async def _auth_refresh() -> bool:
+                    ok = await _refresh_once(
+                        pool, current, session_dir, provider, verbose,
+                    )
+                    if ok:
+                        # Re-anchor the scheduled loop to the token we just
+                        # minted, instead of leaving it asleep on the old
+                        # deadline.
+                        refresh_wake.set()
+                    return ok
+
+                async def _auth_report(code: str, message: str) -> None:
+                    await pool.report_error(
+                        current["lease"]["lease_id"], code, message,
+                    )
+
+                async def _auth_swap(reason: str) -> None:
+                    await on_swap_needed({"reason": reason})
+
+                recovery = _auth_watch.AuthRecovery(
+                    refresh=_auth_refresh,
+                    report_error=_auth_report,
+                    swap=_auth_swap,
+                    verbose=verbose,
+                )
+                signals: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+                def _on_line(line: str) -> None:
+                    if _auth_watch.looks_like_auth_failure(line):
+                        with suppress(asyncio.QueueFull):
+                            signals.put_nowait(line)
+
+                async def _consume_signals() -> None:
+                    while True:
+                        sample = await signals.get()
+                        await recovery.on_signal(sample)
+
+                aux.append(asyncio.create_task(
+                    _consume_signals(), name=f"sp-{provider.name}-authrecover",
+                ))
+                for stream, sink in (
+                    (proc.stdout, _auth_watch.stdout_sink()),
+                    (proc.stderr, _auth_watch.stderr_sink()),
+                ):
+                    if stream is None:
+                        continue
+                    t = asyncio.create_task(
+                        _auth_watch.pump(stream, sink, _on_line),
+                        name=f"sp-{provider.name}-pump",
+                    )
+                    pumps.append(t)
+                    aux.append(t)
+
             try:
                 exit_code = await proc.wait()
+                # The child can exit with bytes still in the pipe buffers.
+                # Let the pumps run to EOF so the caller sees every byte,
+                # but never hang the exit on a stuck reader.
+                if pumps:
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            asyncio.gather(*pumps, return_exceptions=True),
+                            timeout=5.0,
+                        )
             finally:
                 for sig in installed_signals:
                     with suppress(NotImplementedError, RuntimeError):
                         loop.remove_signal_handler(sig)
                 refresher.cancel()
                 watcher.cancel()
-                for t in (refresher, watcher):
+                for t in aux:
+                    t.cancel()
+                for t in (refresher, watcher, *aux):
                     with suppress(asyncio.CancelledError, Exception):
                         await t
                 await pool.release(current["lease"]["lease_id"])
