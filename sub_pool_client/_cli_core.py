@@ -19,7 +19,7 @@ import tempfile
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import click
 import httpx
@@ -27,7 +27,12 @@ import httpx
 from sub_pool_client import _auth_watch
 from sub_pool_client._cli_provider import CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
-from sub_pool_client._shared import next_refresh_sleep
+from sub_pool_client._shared import (
+    LeaseRequestId,
+    check_pool_url,
+    next_refresh_sleep,
+    release_lease,
+)
 from sub_pool_client._swap import NoSwapAvailable, swap_credentials
 
 
@@ -169,9 +174,15 @@ def run_setup(provider: CliProvider) -> int:
             "Pool URL", default=pool_default or "https://",
             show_default=bool(pool_default),
         ).strip()
-        if pool_url.startswith(("http://", "https://")) and len(pool_url) > 8:
+        if not (pool_url.startswith(("http://", "https://"))
+                and len(pool_url) > 8):
+            click.echo("  → must start with http:// or https://", err=True)
+            continue
+        try:
+            check_pool_url(pool_url)
             break
-        click.echo("  → must start with http:// or https://", err=True)
+        except ValueError as e:
+            click.echo(f"  → {e}", err=True)
     api_key = click.prompt("API key (cp-...)", hide_input=True).strip()
     default_account = click.prompt(
         f"Default {provider.name} account (empty = strategy-based)",
@@ -318,38 +329,49 @@ class PoolHTTP:
             headers={"Authorization": f"Bearer {cfg.api_key}"},
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
+        # Covers the initial lease and every swap; see LeaseRequestId.
+        self._lease_rid = LeaseRequestId()
+        # Called with the status whenever the pool answers 401/403.
+        self.on_key_rejected: Callable[[int], None] | None = None
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def _send(self, method: str, url: str, **kw: Any) -> httpx.Response:
+        r = await self._client.request(method, url, **kw)
+        if r.status_code in (401, 403) and self.on_key_rejected is not None:
+            self.on_key_rejected(r.status_code)
+        return r
 
     async def lease(self, provider: CliProvider, *,
                     account: str | None = None,
                     user_id: str | None = None,
                     required_model: str | None = None) -> dict:
         body: dict[str, Any] = dict(provider.lease_body_extras)
+        body["request_id"] = self._lease_rid.value
         if account:
             body["account"] = account
         if user_id:
             body["user_id"] = user_id
         if required_model:
             body["required_model"] = required_model
-        r = await self._client.post("/credentials/lease", json=body)
+        r = await self._send("POST", "/credentials/lease", json=body)
         r.raise_for_status()
+        self._lease_rid.retire()
         return r.json()
 
     async def refresh_token(self, lease_id: str) -> dict:
-        r = await self._client.post(f"/credentials/lease/{lease_id}/token")
+        r = await self._send("POST", f"/credentials/lease/{lease_id}/token")
         r.raise_for_status()
         return r.json()
 
     async def release(self, lease_id: str) -> None:
-        with suppress(Exception):
-            await self._client.request(
-                "DELETE", f"/credentials/lease/{lease_id}", json={},
-            )
+        await release_lease(lambda: self._send(
+            "DELETE", f"/credentials/lease/{lease_id}", json={},
+        ), lease_id)
 
     async def health(self, lease_id: str) -> dict:
-        r = await self._client.get(f"/credentials/lease/{lease_id}/health")
+        r = await self._send("GET", f"/credentials/lease/{lease_id}/health")
         r.raise_for_status()
         return r.json()
 
@@ -367,8 +389,8 @@ class PoolHTTP:
         that follows.
         """
         with suppress(Exception):
-            await self._client.post(
-                f"/credentials/lease/{lease_id}/report-error",
+            await self._send(
+                "POST", f"/credentials/lease/{lease_id}/report-error",
                 json={"code": code, "message": message},
             )
 
@@ -508,6 +530,11 @@ async def run_session(
             err=True,
         )
         return 2
+    try:
+        check_pool_url(cfg.pool_url)
+    except ValueError as e:
+        click.echo(f"[sp-{provider.name}] {e}", err=True)
+        return 2
 
     if verbose:
         logging.basicConfig(
@@ -524,6 +551,10 @@ async def run_session(
     required_model = model_from_args(prompt_args)
 
     pool = PoolHTTP(cfg)
+    # Set once we hold a lease. The outer finally releases whatever it points
+    # at by then (a swap may have advanced it), however the session ends —
+    # including a failure before the child ever starts (e.g. a missing binary).
+    current: dict | None = None
     try:
         try:
             lease = await pool.lease(
@@ -536,6 +567,7 @@ async def run_session(
         except httpx.HTTPError as e:
             click.echo(f"[sp-{provider.name}] pool unreachable: {e}", err=True)
             return 3
+        current = {"lease": lease}
         if verbose:
             log.info("leased %s (lease_id=%s)",
                      lease.get("account"), lease.get("lease_id"))
@@ -583,7 +615,6 @@ async def run_session(
                 installed_signals.append(sig)
 
             # Background tasks: token refresh + health-driven account swap.
-            current = {"lease": lease}
             # Set by a successful swap so the expiry-anchored refresh loop
             # re-anchors to the NEW lease's token instead of sleeping out a
             # now-stale deadline — a swapped-in token may have far less life
@@ -650,6 +681,9 @@ async def run_session(
                 ).run(),
                 name=f"sp-{provider.name}-health",
             )
+            # Everything that talks to the pool on our behalf, stopped as a
+            # unit if the pool rejects the key.
+            maintenance = [refresher, watcher]
 
             # Output-driven auth recovery. Detection runs in the pumps (sync,
             # non-blocking); the ACTION runs in one consumer task fed by a
@@ -696,9 +730,10 @@ async def run_session(
                         sample = await signals.get()
                         await recovery.on_signal(sample)
 
-                aux.append(asyncio.create_task(
+                maintenance.append(asyncio.create_task(
                     _consume_signals(), name=f"sp-{provider.name}-authrecover",
                 ))
+                aux.append(maintenance[-1])
                 for stream, sink in (
                     (proc.stdout, _auth_watch.stdout_sink()),
                     (proc.stderr, _auth_watch.stderr_sink()),
@@ -711,6 +746,22 @@ async def run_session(
                     )
                     pumps.append(t)
                     aux.append(t)
+
+            def _on_key_rejected(status: int) -> None:
+                # A revoked / expired key fails every call; retrying just
+                # polls a dead key forever. Report once and stop.
+                pool.on_key_rejected = None
+                click.echo(
+                    f"[sp-{provider.name}] API key rejected by the pool "
+                    f"({status}) — stopping lease maintenance. The session "
+                    f"keeps its current credential until it expires; check "
+                    f"the key with `sp-{provider.name} --setup`.",
+                    err=True,
+                )
+                for t in maintenance:
+                    t.cancel()
+
+            pool.on_key_rejected = _on_key_rejected
 
             try:
                 exit_code = await proc.wait()
@@ -727,6 +778,7 @@ async def run_session(
                 for sig in installed_signals:
                     with suppress(NotImplementedError, RuntimeError):
                         loop.remove_signal_handler(sig)
+                pool.on_key_rejected = None
                 refresher.cancel()
                 watcher.cancel()
                 for t in aux:
@@ -734,13 +786,14 @@ async def run_session(
                 for t in (refresher, watcher, *aux):
                     with suppress(asyncio.CancelledError, Exception):
                         await t
-                await pool.release(current["lease"]["lease_id"])
         finally:
             with suppress(Exception):
                 commit_session_to_home(session_dir, home_dir, provider)
             shutil.rmtree(session_dir, ignore_errors=True)
         return exit_code
     finally:
+        if current is not None:
+            await pool.release(current["lease"]["lease_id"])
         await pool.aclose()
 
 

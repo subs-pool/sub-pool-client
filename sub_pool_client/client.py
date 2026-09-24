@@ -52,11 +52,16 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore
 
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
+    LeaseRequestId,
+    check_pool_url,
     cleanup_dir,
     dir_key,
+    jittered,
     locked_meta,
     next_refresh_sleep,
+    release_lease,
     shared_dir,
+    sweep_stale_dirs_once,
     write_credentials,
 )
 from sub_pool_client.errors import (
@@ -92,9 +97,13 @@ class PooledClient(ClaudeSDKClient):
             raise ValueError("pool_url required (set SUB_POOL_URL)")
         if not self._api_key:
             raise ValueError("api_key required (set SUB_POOL_KEY)")
+        check_pool_url(self._pool_url)
 
         self._user_id = user_id
         self._request_id_req = request_id
+        # request_id for our own lease POSTs (see LeaseRequestId); never the
+        # caller's, so a swap can't be deduped back onto the current lease.
+        self._lease_rid = LeaseRequestId()
         self._required_model = required_model
         self._required_features = list(required_features or [])
         self._health_interval_s = health_interval_s
@@ -120,6 +129,7 @@ class PooledClient(ClaudeSDKClient):
         self._poll_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._key_rejected = False
         # Set by a health swap to interrupt the poll loop's (possibly
         # multi-hour) sleep so it reschedules against the NEW account's token
         # expiry — otherwise a swap to a shorter-lived token could expire
@@ -135,6 +145,7 @@ class PooledClient(ClaudeSDKClient):
             user_id=self._user_id,
             required_model=self._required_model,
         )
+        await sweep_stale_dirs_once()
         self._dir = shared_dir(key)
 
         await self._join_or_acquire_lease()
@@ -145,9 +156,16 @@ class PooledClient(ClaudeSDKClient):
         # the whole shared-refresh model, so drop it explicitly.
         self._base_options.env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
 
-        ClaudeSDKClient.__init__(self, options=self._base_options)
-        self._sdk_inited = True
-        await ClaudeSDKClient.__aenter__(self)
+        try:
+            ClaudeSDKClient.__init__(self, options=self._base_options)
+            self._sdk_inited = True
+            await ClaudeSDKClient.__aenter__(self)
+        except BaseException:
+            # __aexit__ never runs for a failed __aenter__, so hand the lease
+            # back here. No error is reported: a local failure isn't the
+            # account's fault.
+            await asyncio.shield(self._leave_lease(None))
+            raise
 
         if self._is_poll_leader:
             self._start_leader_tasks()
@@ -192,53 +210,64 @@ class PooledClient(ClaudeSDKClient):
     async def _join_or_acquire_lease(self) -> None:
         assert self._dir is not None
         my_pid = os.getpid()
+        # Set once a lease exists server-side: any failure after that (bad
+        # bundle, disk write, meta persist, cancellation) releases it rather
+        # than leaking it to the TTL reaper.
+        new_lease_id: str | None = None
+        try:
+            async with locked_meta(self._dir) as meta:
+                if meta.lease_id and meta.holders:
+                    # Active lease already present — reuse it. Read identity +
+                    # expiry from meta (the shared source of truth): a prior
+                    # health swap may have advanced them past what any earlier
+                    # holder saw, and we may be promoted to leader later.
+                    self._lease_id = meta.lease_id
+                    self._lease_account = meta.account
+                    self._lease_account_id = meta.account_id
+                    self._token_expires_at = meta.token_expires_at
+                    # Always append (one entry per __aenter__, not per pid)
+                    # so N `async with` in the same pid are refcounted by
+                    # N removes on exit.
+                    meta.holders.append(my_pid)
+                    # If no live leader, take the seat. locked_meta already
+                    # cleared dead-pid leaders so poll_leader is either a
+                    # live pid or None here.
+                    if meta.poll_leader is None:
+                        meta.poll_leader = my_pid
+                        self._is_poll_leader = True
+                    return
 
-        async with locked_meta(self._dir) as meta:
-            if meta.lease_id and meta.holders:
-                # Active lease already present — reuse it. Read identity +
-                # expiry from meta (the shared source of truth): a prior
-                # health swap may have advanced them past what any earlier
-                # holder saw, and we may be promoted to leader later.
-                self._lease_id = meta.lease_id
-                self._lease_account = meta.account
-                self._lease_account_id = meta.account_id
-                self._token_expires_at = meta.token_expires_at
-                # Always append (one entry per __aenter__, not per pid)
-                # so N `async with` in the same pid are refcounted by
-                # N removes on exit.
-                meta.holders.append(my_pid)
-                # If no live leader, take the seat. locked_meta already
-                # cleared dead-pid leaders so poll_leader is either a
-                # live pid or None here.
-                if meta.poll_leader is None:
-                    meta.poll_leader = my_pid
-                    self._is_poll_leader = True
-                return
-
-            # No live holders → we're the first in. Acquire lease.
-            lease = await self._post_lease()
-            bundle = lease.get("credentials") or {}
-            if not bundle.get("access_token"):
-                raise PoolUpstreamError(
-                    "MissingBundle",
-                    "lease response did not include a credentials bundle",
+                # No live holders → we're the first in. Acquire lease.
+                lease = await self._post_lease(
+                    self._request_id_req or self._lease_rid.value,
                 )
-            write_credentials(self._dir, bundle)
-            self._lease_id = lease["lease_id"]
-            self._lease_account = lease.get("account")
-            self._lease_account_id = lease.get("pool_account_id")
-            self._lease_request_id = lease.get("request_id")
-            self._token_expires_at = float(
-                bundle.get("expires_at") or lease.get("token_expires_at") or 0.0
-            )
-            meta.lease_id = self._lease_id
-            meta.account = self._lease_account
-            meta.account_id = self._lease_account_id
-            meta.token_expires_at = self._token_expires_at
-            meta.holders = [my_pid]
-            meta.poll_leader = my_pid
-            self._is_first_holder = True
-            self._is_poll_leader = True
+                new_lease_id = lease["lease_id"]
+                bundle = lease.get("credentials") or {}
+                if not bundle.get("access_token"):
+                    raise PoolUpstreamError(
+                        "MissingBundle",
+                        "lease response did not include a credentials bundle",
+                    )
+                write_credentials(self._dir, bundle)
+                self._lease_id = new_lease_id
+                self._lease_account = lease.get("account")
+                self._lease_account_id = lease.get("pool_account_id")
+                self._lease_request_id = lease.get("request_id")
+                self._token_expires_at = float(
+                    bundle.get("expires_at") or lease.get("token_expires_at") or 0.0
+                )
+                meta.lease_id = self._lease_id
+                meta.account = self._lease_account
+                meta.account_id = self._lease_account_id
+                meta.token_expires_at = self._token_expires_at
+                meta.holders = [my_pid]
+                meta.poll_leader = my_pid
+                self._is_first_holder = True
+                self._is_poll_leader = True
+        except BaseException:
+            if new_lease_id is not None:
+                await asyncio.shield(self._delete_lease(new_lease_id, None))
+            raise
 
     async def _leave_lease(self, exc: BaseException | None) -> None:
         if self._dir is None or self._lease_id is None:
@@ -270,10 +299,7 @@ class PooledClient(ClaudeSDKClient):
                 last_out = True
 
         if last_out and lease_id_to_release is not None:
-            try:
-                await self._delete_lease(lease_id_to_release, exc)
-            except Exception:
-                log.exception("lease release failed (best-effort)")
+            await self._delete_lease(lease_id_to_release, exc)
             cleanup_dir(self._dir)
 
     # ============================================================ heartbeat
@@ -288,7 +314,7 @@ class PooledClient(ClaudeSDKClient):
         """
         try:
             while True:
-                await asyncio.sleep(interval_s)
+                await asyncio.sleep(jittered(interval_s))
                 if self._is_poll_leader or self._dir is None:
                     continue
 
@@ -353,6 +379,8 @@ class PooledClient(ClaudeSDKClient):
                 lease_id_before = self._lease_id
                 try:
                     new = await self._post_poll_token()
+                except PoolAuthError:
+                    return  # key rejected; _on_key_rejected stopped maintenance
                 except Exception as e:  # noqa: BLE001
                     # If a swap rotated us mid-poll, this failure is just the
                     # OLD lease's 410 — don't clobber the new expiry the swap
@@ -375,7 +403,9 @@ class PooledClient(ClaudeSDKClient):
                 new_access = new.get("access_token")
                 new_exp = float(new.get("token_expires_at") or 0.0)
                 if not new_access or not new_exp:
-                    log.warning("lease token poll returned empty bundle: %s", new)
+                    # Field names only: the body carries the access token.
+                    log.warning("lease token poll returned an incomplete "
+                                "response (fields: %s)", sorted(new))
                     continue
 
                 # Rewrite shared .credentials.json with the new access_token
@@ -400,6 +430,9 @@ class PooledClient(ClaudeSDKClient):
             f"{self._pool_url}/credentials/lease/{self._lease_id}/token",
             headers={"authorization": f"Bearer {self._api_key}"},
         )
+        if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
+            raise PoolAuthError(f"HTTP{r.status_code}", "authorization failed")
         if r.status_code >= 400:
             detail = _detail_or_text(r)
             raise PoolUpstreamError(
@@ -439,10 +472,28 @@ class PooledClient(ClaudeSDKClient):
             f"{self._pool_url}/credentials/lease/{lease_id}/health",
             headers={"authorization": f"Bearer {self._api_key}"},
         )
+        if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
         # 404 (unknown lease) / 410 (lease ended) → HealthWatcher recovers by
-        # re-leasing (lease_gone). Other non-2xx are logged + retried.
+        # re-leasing (lease_gone); 401/403 stop it. Other non-2xx are logged +
+        # retried.
         r.raise_for_status()
         return r.json()
+
+    def _on_key_rejected(self, status: int) -> None:
+        """The pool answered 401/403: our API key is revoked, expired or wrong,
+        and no retry will fix that. Stop the background loops (poll, health,
+        heartbeat) instead of polling a dead key forever. A no-op until
+        __aenter__ has started them (the failing call raises to the caller)."""
+        tasks = [t for t in (self._poll_task, self._health_task,
+                             self._heartbeat_task) if t is not None]
+        if self._key_rejected or not tasks:
+            return
+        self._key_rejected = True
+        log.error("API key rejected by the pool (%s) — stopping lease "
+                  "maintenance", status)
+        for t in tasks:
+            t.cancel()
 
     async def _on_unhealthy(self, health: dict) -> None:
         await self._swap_account(
@@ -462,11 +513,13 @@ class PooledClient(ClaudeSDKClient):
         old_account = self._lease_account
         old_account_id = self._lease_account_id
         try:
-            # Do NOT reuse the caller's request_id here: the pool dedupes leases
-            # by request_id and would idempotently hand back the CURRENT
+            # Our own request_id, never the caller's: the pool dedupes leases by
+            # request_id and would idempotently hand back the CURRENT
             # (still-active, unhealthy) lease instead of a fresh account — the
             # swap would silently no-op forever ("no other account" every tick).
-            lease = await self._post_lease(include_request_id=False)
+            # It survives a failed attempt, so a POST that timed out after the
+            # pool committed it is handed back next tick instead of orphaned.
+            lease = await self._post_lease(self._lease_rid.value)
         except PoolError as e:
             # 503 (all other accounts cooling/invalid) or a transient pool
             # blip — don't tear down a working lease over it; retry next tick.
@@ -540,14 +593,12 @@ class PooledClient(ClaudeSDKClient):
                 # Never took ownership → release the orphaned new lease so it
                 # isn't leaked to the reaper. Shield so an in-flight cancel
                 # can't skip the cleanup.
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(self._delete_lease(new_lease_id, None))
+                await asyncio.shield(self._delete_lease(new_lease_id, None))
 
-        # Release the cooled / dead lease. Shielded + best-effort so a
-        # concurrent __aexit__ cancel can't leak it. (Skipped if the meta
-        # persist above threw — the old lease then falls to the reaper.)
-        with contextlib.suppress(Exception):
-            await asyncio.shield(self._delete_lease(old_lease_id, None))
+        # Release the cooled / dead lease. Shielded so a concurrent __aexit__
+        # cancel can't leak it. (Skipped if the meta persist above threw — the
+        # old lease then falls to the reaper.)
+        await asyncio.shield(self._delete_lease(old_lease_id, None))
         log.info("health-swapped account %s → %s (lease %s → %s; reason: %s)",
                  old_account, new_account, old_lease_id, new_lease_id, reason[:80])
 
@@ -556,16 +607,13 @@ class PooledClient(ClaudeSDKClient):
         or same-account), so a deferred swap never leaks it. Shielded so an
         __aexit__ cancel landing on the DELETE can't skip the cleanup."""
         if new_lease_id and new_lease_id != old_lease_id:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(self._delete_lease(new_lease_id, None))
+            await asyncio.shield(self._delete_lease(new_lease_id, None))
 
     # ============================================================ HTTP
-    async def _post_lease(self, *, include_request_id: bool = True) -> dict:
-        body: dict[str, Any] = {"provider": "claude"}
+    async def _post_lease(self, request_id: str) -> dict:
+        body: dict[str, Any] = {"provider": "claude", "request_id": request_id}
         if self._user_id:
             body["user_id"] = self._user_id
-        if include_request_id and self._request_id_req:
-            body["request_id"] = self._request_id_req
         if self._required_model:
             body["required_model"] = self._required_model
         if self._required_features:
@@ -582,6 +630,7 @@ class PooledClient(ClaudeSDKClient):
             raise PoolConnectionError("HTTPError", str(e)) from e
 
         if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
             raise PoolAuthError(
                 f"HTTP{r.status_code}", r.text[:500] or "authorization failed",
             )
@@ -591,6 +640,7 @@ class PooledClient(ClaudeSDKClient):
                 str(detail.get("code") or f"HTTP{r.status_code}"),
                 str(detail.get("message") or r.text[:500]),
             )
+        self._lease_rid.retire()
         return r.json()
 
     async def _delete_lease(
@@ -600,15 +650,12 @@ class PooledClient(ClaudeSDKClient):
         if exc is not None:
             body["error_code"] = type(exc).__name__
             body["error_message"] = str(exc)[:2000]
-        try:
-            await self._http.request(
-                "DELETE",
-                f"{self._pool_url}/credentials/lease/{lease_id}",
-                headers={"authorization": f"Bearer {self._api_key}"},
-                json=body,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("DELETE lease %s failed (best-effort): %s", lease_id, e)
+        await release_lease(lambda: self._http.request(
+            "DELETE",
+            f"{self._pool_url}/credentials/lease/{lease_id}",
+            headers={"authorization": f"Bearer {self._api_key}"},
+            json=body,
+        ), lease_id)
 
     # ============================================================ error reporting
     async def report_error(self, code: str, message: str) -> dict:
@@ -630,6 +677,8 @@ class PooledClient(ClaudeSDKClient):
         except Exception as e:  # noqa: BLE001
             log.warning("report_error HTTP failed: %s", e)
             return {}
+        if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
         if r.status_code >= 400:
             log.warning("report_error %s: %s", r.status_code, r.text[:200])
             return {}

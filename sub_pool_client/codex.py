@@ -29,11 +29,16 @@ import httpx
 
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
+    LeaseRequestId,
+    check_pool_url,
     cleanup_dir,
     dir_key,
+    jittered,
     locked_meta,
     next_refresh_sleep,
+    release_lease,
     shared_dir,
+    sweep_stale_dirs_once,
     write_codex_auth,
 )
 from sub_pool_client.errors import (
@@ -74,9 +79,13 @@ class PooledCodexClient:
             raise ValueError("pool_url required (set SUB_POOL_URL)")
         if not self._api_key:
             raise ValueError("api_key required (set SUB_POOL_KEY)")
+        check_pool_url(self._pool_url)
 
         self._user_id = user_id
         self._request_id_req = request_id
+        # request_id for our own lease POSTs (see LeaseRequestId); never the
+        # caller's, so a swap can't be deduped back onto the current lease.
+        self._lease_rid = LeaseRequestId()
         self._required_model = required_model
         self._required_features = list(required_features or [])
         self._codex_bin = codex_bin
@@ -95,6 +104,7 @@ class PooledCodexClient:
         self._health_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._is_poll_leader: bool = False
+        self._key_rejected = False
         # Set by a health swap to interrupt the poll loop's (possibly very long,
         # Codex tokens run ~10 days) sleep so it reschedules against the NEW
         # account's token expiry.
@@ -108,6 +118,7 @@ class PooledCodexClient:
             user_id=self._user_id,
             required_model=self._required_model,
         )
+        await sweep_stale_dirs_once()
         self._dir = shared_dir(key)
         await self._join_or_acquire_lease()
         if self._is_poll_leader:
@@ -185,6 +196,8 @@ class PooledCodexClient:
         except Exception as e:  # noqa: BLE001
             log.warning("codex report_error HTTP failed: %s", e)
             return {}
+        if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
         if r.status_code >= 400:
             log.warning("codex report_error %s: %s", r.status_code, r.text[:200])
             return {}
@@ -233,46 +246,58 @@ class PooledCodexClient:
     async def _join_or_acquire_lease(self) -> None:
         assert self._dir is not None
         my_pid = os.getpid()
-        async with locked_meta(self._dir) as meta:
-            if meta.lease_id and meta.holders:
-                # Active lease already present — reuse it. Read identity +
-                # expiry from meta (shared source of truth): a prior health
-                # swap may have advanced them, and we may be promoted later.
-                self._lease_id = meta.lease_id
-                self._lease_account = meta.account
-                self._lease_account_id = meta.account_id
-                self._token_expires_at = meta.token_expires_at
-                meta.holders.append(my_pid)
-                # locked_meta cleared dead-pid leaders, so poll_leader is
-                # either a live pid or None. Claim leadership right away
-                # if vacant; otherwise the heartbeat task will promote
-                # us if the current leader exits.
-                if meta.poll_leader is None:
-                    meta.poll_leader = my_pid
-                    self._is_poll_leader = True
-                return
+        # Set once a lease exists server-side: any failure after that (missing
+        # bundle, disk write, meta persist, cancellation) releases it rather
+        # than leaking it to the TTL reaper.
+        new_lease_id: str | None = None
+        try:
+            async with locked_meta(self._dir) as meta:
+                if meta.lease_id and meta.holders:
+                    # Active lease already present — reuse it. Read identity +
+                    # expiry from meta (shared source of truth): a prior health
+                    # swap may have advanced them, and we may be promoted later.
+                    self._lease_id = meta.lease_id
+                    self._lease_account = meta.account
+                    self._lease_account_id = meta.account_id
+                    self._token_expires_at = meta.token_expires_at
+                    meta.holders.append(my_pid)
+                    # locked_meta cleared dead-pid leaders, so poll_leader is
+                    # either a live pid or None. Claim leadership right away
+                    # if vacant; otherwise the heartbeat task will promote
+                    # us if the current leader exits.
+                    if meta.poll_leader is None:
+                        meta.poll_leader = my_pid
+                        self._is_poll_leader = True
+                    return
 
-            lease = await self._post_lease()
-            creds = lease.get("credentials") or {}
-            auth_json = creds.get("auth_json")
-            if not isinstance(auth_json, dict):
-                raise PoolUpstreamError(
-                    "MissingBundle",
-                    "lease response did not include a Codex auth_json bundle",
+                lease = await self._post_lease(
+                    self._request_id_req or self._lease_rid.value,
                 )
-            write_codex_auth(self._dir, auth_json)
-            self._lease_id = lease["lease_id"]
-            self._lease_account = lease.get("account")
-            self._lease_account_id = lease.get("pool_account_id")
-            self._lease_request_id = lease.get("request_id")
-            self._token_expires_at = float(lease.get("token_expires_at") or 0.0)
-            meta.lease_id = self._lease_id
-            meta.account = self._lease_account
-            meta.account_id = self._lease_account_id
-            meta.token_expires_at = self._token_expires_at
-            meta.holders = [my_pid]
-            meta.poll_leader = my_pid
-            self._is_poll_leader = True
+                new_lease_id = lease["lease_id"]
+                creds = lease.get("credentials") or {}
+                auth_json = creds.get("auth_json")
+                if not isinstance(auth_json, dict):
+                    raise PoolUpstreamError(
+                        "MissingBundle",
+                        "lease response did not include a Codex auth_json bundle",
+                    )
+                write_codex_auth(self._dir, auth_json)
+                self._lease_id = new_lease_id
+                self._lease_account = lease.get("account")
+                self._lease_account_id = lease.get("pool_account_id")
+                self._lease_request_id = lease.get("request_id")
+                self._token_expires_at = float(lease.get("token_expires_at") or 0.0)
+                meta.lease_id = self._lease_id
+                meta.account = self._lease_account
+                meta.account_id = self._lease_account_id
+                meta.token_expires_at = self._token_expires_at
+                meta.holders = [my_pid]
+                meta.poll_leader = my_pid
+                self._is_poll_leader = True
+        except BaseException:
+            if new_lease_id is not None:
+                await asyncio.shield(self._delete_lease(new_lease_id, None))
+            raise
 
     async def _leave_lease(self, exc: BaseException | None) -> None:
         if self._dir is None or self._lease_id is None:
@@ -296,10 +321,7 @@ class PooledCodexClient:
                 last_out = True
 
         if last_out and lease_id_to_release is not None:
-            try:
-                await self._delete_lease(lease_id_to_release, exc)
-            except Exception:
-                log.exception("lease release failed (best-effort)")
+            await self._delete_lease(lease_id_to_release, exc)
             cleanup_dir(self._dir)
 
     async def _heartbeat_loop(self, interval_s: float = 30.0) -> None:
@@ -309,7 +331,7 @@ class PooledCodexClient:
         (b) promotes itself if the poll leader is gone."""
         try:
             while True:
-                await asyncio.sleep(interval_s)
+                await asyncio.sleep(jittered(interval_s))
                 if self._is_poll_leader or self._dir is None:
                     continue
                 my_pid = os.getpid()
@@ -361,6 +383,8 @@ class PooledCodexClient:
                 lease_id_before = self._lease_id
                 try:
                     new = await self._post_poll_token()
+                except PoolAuthError:
+                    return  # key rejected; _on_key_rejected stopped maintenance
                 except Exception as e:  # noqa: BLE001
                     # If a swap rotated us mid-poll, this is just the OLD lease's
                     # 410 — don't clobber the new expiry the swap already set.
@@ -381,9 +405,9 @@ class PooledCodexClient:
                 new_auth = creds.get("auth_json")
                 new_exp = float(new.get("token_expires_at") or 0.0)
                 if not isinstance(new_auth, dict) or not new_exp:
-                    log.warning(
-                        "codex poll returned empty bundle: %s", new,
-                    )
+                    # Field names only: the body carries auth_json's tokens.
+                    log.warning("codex poll returned an incomplete response "
+                                "(fields: %s)", sorted(new))
                     continue
 
                 try:
@@ -406,6 +430,9 @@ class PooledCodexClient:
             f"{self._pool_url}/credentials/lease/{self._lease_id}/token",
             headers={"authorization": f"Bearer {self._api_key}"},
         )
+        if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
+            raise PoolAuthError(f"HTTP{r.status_code}", "authorization failed")
         if r.status_code >= 400:
             detail = _detail_or_text(r)
             raise PoolUpstreamError(
@@ -442,10 +469,28 @@ class PooledCodexClient:
             f"{self._pool_url}/credentials/lease/{lease_id}/health",
             headers={"authorization": f"Bearer {self._api_key}"},
         )
+        if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
         # 404 (unknown lease) / 410 (lease ended) → HealthWatcher recovers by
-        # re-leasing (lease_gone). Other non-2xx are logged + retried.
+        # re-leasing (lease_gone); 401/403 stop it. Other non-2xx are logged +
+        # retried.
         r.raise_for_status()
         return r.json()
+
+    def _on_key_rejected(self, status: int) -> None:
+        """The pool answered 401/403: our API key is revoked, expired or wrong,
+        and no retry will fix that. Stop the background loops (poll, health,
+        heartbeat) instead of polling a dead key forever. A no-op until
+        __aenter__ has started them (the failing call raises to the caller)."""
+        tasks = [t for t in (self._poll_task, self._health_task,
+                             self._heartbeat_task) if t is not None]
+        if self._key_rejected or not tasks:
+            return
+        self._key_rejected = True
+        log.error("API key rejected by the pool (%s) — stopping lease "
+                  "maintenance", status)
+        for t in tasks:
+            t.cancel()
 
     async def _on_unhealthy(self, health: dict) -> None:
         await self._swap_account(
@@ -465,10 +510,11 @@ class PooledCodexClient:
         old_account = self._lease_account
         old_account_id = self._lease_account_id
         try:
-            # Do NOT reuse the caller's request_id: the pool dedupes by it and
+            # Our own request_id, never the caller's: the pool dedupes by it and
             # would hand back the current (unhealthy) lease, making the swap a
-            # silent no-op forever.
-            lease = await self._post_lease(include_request_id=False)
+            # silent no-op forever. It survives a failed attempt, so a POST that
+            # timed out after the pool committed it is handed back next tick.
+            lease = await self._post_lease(self._lease_rid.value)
         except PoolError as e:
             log.info("codex health swap deferred: new lease failed: %s", e)
             return
@@ -528,13 +574,11 @@ class PooledCodexClient:
                 committed = True
         finally:
             if not committed:
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(self._delete_lease(new_lease_id, None))
+                await asyncio.shield(self._delete_lease(new_lease_id, None))
 
         # Release the cooled/dead old lease (skipped if the meta persist above
         # threw — it then falls to the reaper).
-        with contextlib.suppress(Exception):
-            await asyncio.shield(self._delete_lease(old_lease_id, None))
+        await asyncio.shield(self._delete_lease(old_lease_id, None))
         log.info("codex health-swapped account %s → %s (lease %s → %s; reason: %s)",
                  old_account, new_account, old_lease_id, new_lease_id, reason[:80])
 
@@ -543,15 +587,12 @@ class PooledCodexClient:
         auth_json or same-account) so a deferred swap never leaks it. Shielded
         so an __aexit__ cancel on the DELETE can't skip the cleanup."""
         if new_lease_id and new_lease_id != old_lease_id:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(self._delete_lease(new_lease_id, None))
+            await asyncio.shield(self._delete_lease(new_lease_id, None))
 
-    async def _post_lease(self, *, include_request_id: bool = True) -> dict:
-        body: dict[str, Any] = {"provider": "codex"}
+    async def _post_lease(self, request_id: str) -> dict:
+        body: dict[str, Any] = {"provider": "codex", "request_id": request_id}
         if self._user_id:
             body["user_id"] = self._user_id
-        if include_request_id and self._request_id_req:
-            body["request_id"] = self._request_id_req
         if self._required_model:
             body["required_model"] = self._required_model
         if self._required_features:
@@ -568,6 +609,7 @@ class PooledCodexClient:
             raise PoolConnectionError("HTTPError", str(e)) from e
 
         if r.status_code in (401, 403):
+            self._on_key_rejected(r.status_code)
             raise PoolAuthError(
                 f"HTTP{r.status_code}", r.text[:500] or "authorization failed",
             )
@@ -577,6 +619,7 @@ class PooledCodexClient:
                 str(detail.get("code") or f"HTTP{r.status_code}"),
                 str(detail.get("message") or r.text[:500]),
             )
+        self._lease_rid.retire()
         return r.json()
 
     async def _delete_lease(
@@ -586,17 +629,13 @@ class PooledCodexClient:
         if exc is not None:
             body["error_code"] = type(exc).__name__
             body["error_message"] = str(exc)[:2000]
-        # Best-effort, like claude's _delete_lease: releasing a lease must never
-        # raise into a swap / release path (the reaper is the backstop).
-        try:
-            await self._http.request(
-                "DELETE",
-                f"{self._pool_url}/credentials/lease/{lease_id}",
-                headers={"authorization": f"Bearer {self._api_key}"},
-                json=body,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("codex DELETE lease %s failed (best-effort): %s", lease_id, e)
+        # Never raises into a swap / release path (the reaper is the backstop).
+        await release_lease(lambda: self._http.request(
+            "DELETE",
+            f"{self._pool_url}/credentials/lease/{lease_id}",
+            headers={"authorization": f"Bearer {self._api_key}"},
+            json=body,
+        ), lease_id)
 
 
 def _detail_or_text(r: httpx.Response) -> dict[str, Any]:

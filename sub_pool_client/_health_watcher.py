@@ -7,7 +7,10 @@ window hit ≥95%). The handler is expected to perform an account swap
 (see `_swap.swap_credentials`).
 
 Transient failures (network blips, 5xx) are swallowed and retried on the
-next tick — the watcher's job is to be quietly reliable, not noisy.
+next tick — the watcher's job is to be quietly reliable, not noisy. Two
+answers end it instead: 401/403 (the API key is rejected; the owner's
+HTTP layer stops the rest of lease maintenance), and a lease that stays
+gone after `MAX_REACQUIRE_ATTEMPTS` re-leases.
 """
 from __future__ import annotations
 
@@ -17,10 +20,16 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from sub_pool_client._shared import jittered
+
 log = logging.getLogger(__name__)
 
 
 class HealthWatcher:
+    # Consecutive re-lease attempts for a gone lease before giving up; the
+    # tick interval doubles after each one that didn't bring the lease back.
+    MAX_REACQUIRE_ATTEMPTS = 5
+
     def __init__(
         self,
         *,
@@ -37,14 +46,19 @@ class HealthWatcher:
         self._interval_s = interval_s
 
     async def run(self) -> None:
+        # Re-leases attempted since the lease was last seen alive. A tick that
+        # still finds it gone means the previous attempt failed.
+        reacquires = 0
         while True:
             try:
-                await asyncio.sleep(self._interval_s)
+                await asyncio.sleep(jittered(self._interval_s * 2 ** reacquires))
             except asyncio.CancelledError:
                 return
             try:
                 data = await self._fetch()
             except httpx.HTTPStatusError as e:
+                if e.response.status_code in (401, 403):
+                    return
                 if e.response.status_code in (404, 410):
                     # Our CURRENT lease died server-side while the session is
                     # still live: reaped after a health-poll gap (e.g. the host
@@ -64,6 +78,14 @@ class HealthWatcher:
                     # out from under a running session, DISABLE the account
                     # (re-lease then 503s and the client quietly waits it out) or
                     # revoke its api-key.
+                    #
+                    # Bounded: each failed attempt doubles the wait, and after
+                    # MAX_REACQUIRE_ATTEMPTS we stop rather than keep leasing.
+                    if reacquires >= self.MAX_REACQUIRE_ATTEMPTS:
+                        log.error("lease still gone after %d re-lease attempts; "
+                                  "giving up on it", reacquires)
+                        return
+                    reacquires += 1
                     try:
                         await self._on_unhealthy({
                             "healthy": False,
@@ -88,6 +110,7 @@ class HealthWatcher:
                 log.debug("health probe unexpected: %s", e)
                 continue
 
+            reacquires = 0
             if data.get("healthy"):
                 continue
 

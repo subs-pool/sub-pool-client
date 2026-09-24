@@ -20,6 +20,11 @@ Coordination rules:
 - When `holders` goes empty, the last holder reads `.credentials.json`
   (possibly rotated by the CLI mid-run) and posts it back to the pool as
   `updated_credentials` on DELETE, then removes the dir.
+
+- Dirs are 0700 and every file in them 0600. A dir left behind by a crash
+  is removed by `sweep_stale_dirs` once it is old and all its holders are
+  dead; `locked_meta` retries on a fresh dir if one is removed while it
+  waits for the lock.
 """
 from __future__ import annotations
 
@@ -27,18 +32,114 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
+import random
 import shutil
+import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
+from urllib.parse import urlsplit
+
+import httpx
+
+log = logging.getLogger(__name__)
 
 
 DEFAULT_ROOT = Path(
     os.environ.get("SUB_POOL_CLIENT_DIR")
     or Path.home() / ".sub-pool" / "client"
 )
+
+
+# ---- pool URL -----------------------------------------------------------
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def check_pool_url(url: str) -> None:
+    """Raise ValueError for a plain-http pool that isn't on this machine:
+    every request carries the API key, and lease responses carry OAuth
+    access tokens."""
+    parts = urlsplit(url)
+    if parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f"refusing plain http:// pool URL {url!r}: the API key and leased "
+            f"credentials would travel unencrypted. Use https:// (http:// is "
+            f"only allowed for localhost / 127.0.0.1 / ::1)."
+        )
+
+
+# ---- lease requests -----------------------------------------------------
+class LeaseRequestId:
+    """Idempotency key for `POST /credentials/lease`.
+
+    The pool dedupes issuance on (request_id, api_key, provider): a POST that
+    repeats the id of a lease it already made returns that lease instead of
+    minting another. So one id covers one logical acquisition across all its
+    attempts, and is retired only once a 2xx proves we hold the lease. Any
+    other outcome keeps it: a timeout, a dropped connection or a proxy 5xx can
+    hide a lease the server did commit, and reusing the id after a genuine
+    rejection is harmless (the pool finds no active lease under it). Without
+    this, every timed-out attempt the server had committed became an orphan
+    held until the TTL reaper.
+    """
+
+    def __init__(self) -> None:
+        self.value = _new_request_id()
+
+    def retire(self) -> None:
+        self.value = _new_request_id()
+
+
+def _new_request_id() -> str:
+    return "req-" + uuid.uuid4().hex
+
+
+RELEASE_ATTEMPTS = 3
+RELEASE_BACKOFF_S = 0.5
+
+
+async def release_lease(
+    send: Callable[[], Awaitable[httpx.Response]], lease_id: str,
+) -> bool:
+    """DELETE a lease via `send`, retrying transient failures. True once the
+    pool confirms it (2xx, or 404/410: already gone).
+
+    Never raises — callers are cleanup paths. A lease we fail to release is
+    held until the pool's TTL reaper; that used to happen silently, which is
+    how leases piled up unnoticed, so the final failure is a WARNING.
+    """
+    problem = ""
+    for attempt in range(RELEASE_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(RELEASE_BACKOFF_S * 2 ** (attempt - 1))
+        try:
+            r = await send()
+        except Exception as e:  # noqa: BLE001
+            problem = f"{type(e).__name__}: {e}"
+            continue
+        if r.is_success or r.status_code in (404, 410):
+            return True
+        problem = f"HTTP {r.status_code}"
+        if r.status_code < 500 and r.status_code not in (408, 429):
+            break  # a definitive rejection (e.g. 401/403) won't change on retry
+    log.warning(
+        "failed to release lease %s (%s); the pool's TTL reaper will end it",
+        lease_id, problem,
+    )
+    return False
+
+
+# ---- polling cadence ----------------------------------------------------
+JITTER = 0.2
+
+
+def jittered(seconds: float) -> float:
+    """`seconds` ±20%, so clients started together don't poll in lockstep."""
+    return seconds * random.uniform(1 - JITTER, 1 + JITTER)
 
 
 # ---- token-refresh scheduling -------------------------------------------
@@ -65,10 +166,15 @@ def next_refresh_sleep(
     `min_sleep_s`. When `expires_at` carries no usable value (<=0), fall back to
     a fixed cadence instead of anchoring to a long-past deadline — that would
     refresh every `min_sleep_s` forever (a needless churn storm that hit codex
-    api-key leases, whose token has no expiry)."""
+    api-key leases, whose token has no expiry).
+
+    The two fixed cadences are jittered so a fleet that failed together (pool
+    outage) doesn't retry together; the expiry-anchored one is exact, since
+    jitter there could overshoot the token's life."""
     if expires_at <= 0:
-        return fallback_s
-    return max(min_sleep_s, expires_at - now - slack_s)
+        return jittered(fallback_s)
+    anchored = expires_at - now - slack_s
+    return anchored if anchored > min_sleep_s else jittered(min_sleep_s)
 
 
 def dir_key(
@@ -94,7 +200,9 @@ def dir_key(
 
 def shared_dir(key: str, root: Path | None = None) -> Path:
     d = (root or DEFAULT_ROOT) / key
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Also tightens a dir an older client created 0755.
+    os.chmod(d, 0o700)
     return d
 
 
@@ -184,14 +292,25 @@ async def locked_meta(dir_: Path) -> AsyncIterator[Meta]:
     meta_path = dir_ / "meta.json"
 
     async with _process_lock(str(dir_.resolve())):
-        # Use O_CREAT so the first arriver creates the lockfile.
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        while True:
+            dir_.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Use O_CREAT so the first arriver creates the lockfile.
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                # flock is sync & blocking; release the loop while waiting so
+                # a second consumer in the same process isn't completely
+                # stuck if someone's running a long inter-process critical
+                # section next door.
+                await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(fd)
+                raise
+            if os.fstat(fd).st_nlink:
+                break
+            # The dir was removed (failed entry / stale sweep) while we waited
+            # for its lock: start over on a fresh one.
+            os.close(fd)
         try:
-            # flock is sync & blocking; release the loop while waiting so
-            # a second consumer in the same process isn't completely
-            # stuck if someone's running a long inter-process critical
-            # section next door.
-            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
             try:
                 raw = meta_path.read_text() if meta_path.exists() else "{}"
                 data = json.loads(raw or "{}")
@@ -208,11 +327,22 @@ async def locked_meta(dir_: Path) -> AsyncIterator[Meta]:
             if meta.poll_leader is not None and not _pid_alive(meta.poll_leader):
                 meta.poll_leader = None
 
-            yield meta
+            try:
+                yield meta
+            except BaseException:
+                # A failed first entry (lease POST / credential write raised)
+                # leaves nothing worth keeping; remove the dir while we still
+                # hold its lock rather than leak an empty one per failure.
+                if not meta.lease_id and not meta.holders:
+                    cleanup_dir(dir_)
+                raise
 
             payload = json.dumps(meta.to_json(), indent=2)
             tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
-            tmp.write_text(payload)
+            tmp_fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(tmp_fd, 0o600)
+            with os.fdopen(tmp_fd, "w") as f:
+                f.write(payload)
             os.replace(tmp, meta_path)
         finally:
             try:
@@ -337,6 +467,56 @@ def cleanup_dir(dir_: Path) -> None:
         shutil.rmtree(dir_, ignore_errors=True)
     except Exception:  # noqa: BLE001
         pass
+
+
+# A dir is only swept once it has also been untouched this long: pid liveness
+# alone can be wrong (another container's pids look dead here, a reused pid
+# looks alive).
+STALE_DIR_AGE_S = 24 * 3600
+_swept = False
+
+
+async def sweep_stale_dirs_once() -> None:
+    """Run `sweep_stale_dirs` on DEFAULT_ROOT, at most once per process."""
+    global _swept
+    if _swept:
+        return
+    _swept = True
+    await asyncio.to_thread(sweep_stale_dirs, DEFAULT_ROOT)
+
+
+def sweep_stale_dirs(root: Path, max_age_s: float = STALE_DIR_AGE_S) -> None:
+    """Best-effort removal of shared dirs a crashed process left behind —
+    each may still hold a credential file. Removes a dir only if its mtime is
+    older than `max_age_s` AND every holder in its meta.json is dead, checked
+    under the dir's lock (skipped if busy). Server-side leases are left to the
+    pool's TTL reaper."""
+    cutoff = time.time() - max_age_s
+    try:
+        dirs = [d for d in root.iterdir() if d.is_dir() and not d.is_symlink()]
+    except OSError:
+        return
+    for d in dirs:
+        try:
+            if d.stat().st_mtime > cutoff:
+                continue
+            fd = os.open(str(d / ".meta.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            try:
+                try:
+                    holders = json.loads((d / "meta.json").read_text()).get("holders")
+                except (OSError, ValueError):
+                    holders = None
+                if not any(_pid_alive(p) for p in holders or []):
+                    cleanup_dir(d)
+            finally:
+                os.close(fd)
+        except Exception as e:  # noqa: BLE001
+            log.debug("stale dir sweep skipped %s: %s", d, e)
 
 
 # The DEFAULT_ROOT constant pulls from $SUB_POOL_CLIENT_DIR at import
