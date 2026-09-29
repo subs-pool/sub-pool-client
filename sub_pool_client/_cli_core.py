@@ -32,6 +32,7 @@ from sub_pool_client._shared import (
     check_pool_url,
     next_refresh_sleep,
     release_lease,
+    token_is_stale,
 )
 from sub_pool_client._swap import NoSwapAvailable, swap_credentials
 
@@ -592,7 +593,9 @@ async def run_session(
             # failure the pool cannot see (a revoked access token on a
             # still-valid grant — see _auth_watch). It requires piping, so it
             # is off whenever stdout is a real terminal: interactive `claude`
-            # is a TUI that needs one. stdin is always inherited.
+            # is a TUI that needs one. stdin is always inherited. What covers
+            # an interactive session instead is `on_healthy` below, which
+            # catches a token the pool rotated out from under us.
             watch_output = _auth_watch.should_watch()
             _pipe = asyncio.subprocess.PIPE if watch_output else None
             proc = await asyncio.create_subprocess_exec(
@@ -667,6 +670,28 @@ async def run_session(
                     if verbose:
                         log.info("swap deferred: %s", e)
 
+            async def _refresh_now() -> bool:
+                ok = await _refresh_once(
+                    pool, current, session_dir, provider, verbose,
+                )
+                if ok:
+                    # Re-anchor the scheduled loop to the token we just
+                    # installed, instead of leaving it asleep on the old
+                    # deadline.
+                    refresh_wake.set()
+                return ok
+
+            async def on_healthy(health: dict) -> None:
+                # The account is fine, but the pool may have rotated its token
+                # — every lease on it shares one — revoking the copy on our
+                # disk. For an interactive session this is the only recovery:
+                # its output can't be watched for 401s (see _auth_watch).
+                if token_is_stale(current["lease"], health):
+                    if verbose:
+                        log.info("pool rotated %s's token; pulling the "
+                                 "current one", current["lease"].get("account"))
+                    await _refresh_now()
+
             refresher = asyncio.create_task(
                 _token_refresh_loop(
                     pool, current, session_dir, provider, verbose,
@@ -678,6 +703,7 @@ async def run_session(
                 HealthWatcher(
                     fetch=lambda: pool.health(current["lease"]["lease_id"]),
                     on_unhealthy=on_swap_needed,
+                    on_healthy=on_healthy,
                 ).run(),
                 name=f"sp-{provider.name}-health",
             )
@@ -693,17 +719,6 @@ async def run_session(
             aux: list[asyncio.Task] = []
             pumps: list[asyncio.Task] = []
             if watch_output:
-                async def _auth_refresh() -> bool:
-                    ok = await _refresh_once(
-                        pool, current, session_dir, provider, verbose,
-                    )
-                    if ok:
-                        # Re-anchor the scheduled loop to the token we just
-                        # minted, instead of leaving it asleep on the old
-                        # deadline.
-                        refresh_wake.set()
-                    return ok
-
                 async def _auth_report(code: str, message: str) -> None:
                     await pool.report_error(
                         current["lease"]["lease_id"], code, message,
@@ -713,7 +728,7 @@ async def run_session(
                     await on_swap_needed({"reason": reason})
 
                 recovery = _auth_watch.AuthRecovery(
-                    refresh=_auth_refresh,
+                    refresh=_refresh_now,
                     report_error=_auth_report,
                     swap=_auth_swap,
                     verbose=verbose,

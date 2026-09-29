@@ -62,6 +62,7 @@ from sub_pool_client._shared import (
     release_lease,
     shared_dir,
     sweep_stale_dirs_once,
+    token_is_stale,
     write_credentials,
 )
 from sub_pool_client.errors import (
@@ -378,7 +379,7 @@ class PooledClient(ClaudeSDKClient):
 
                 lease_id_before = self._lease_id
                 try:
-                    new = await self._post_poll_token()
+                    await self._pull_token()
                 except PoolAuthError:
                     return  # key rejected; _on_key_rejected stopped maintenance
                 except Exception as e:  # noqa: BLE001
@@ -392,37 +393,47 @@ class PooledClient(ClaudeSDKClient):
                     # shouldn't tear down the agent.
                     self._token_expires_at = time.time() + 60.0
                     continue
-
-                # A health-driven swap may have rotated us onto a different
-                # lease/account while this poll was in flight. The token we
-                # just fetched belongs to the OLD lease; writing it onto the
-                # NEW account's shared credentials file would clobber the swap.
-                if self._lease_id != lease_id_before:
-                    continue
-
-                new_access = new.get("access_token")
-                new_exp = float(new.get("token_expires_at") or 0.0)
-                if not new_access or not new_exp:
-                    # Field names only: the body carries the access token.
-                    log.warning("lease token poll returned an incomplete "
-                                "response (fields: %s)", sorted(new))
-                    continue
-
-                # Rewrite shared .credentials.json with the new access_token
-                # (keep existing refresh_token + scopes + subscriptionType).
-                try:
-                    _patch_access_token(self._dir, new_access, new_exp)
-                except OSError as e:
-                    log.warning("failed to update .credentials.json: %s", e)
-                    continue
-
-                self._token_expires_at = new_exp
-                log.debug(
-                    "rotated access_token for lease %s (exp=%s)",
-                    self._lease_id, new_exp,
-                )
         except asyncio.CancelledError:
             return
+
+    async def _pull_token(self) -> bool:
+        """POST /token and install the answer in the shared credentials file.
+
+        False when the answer can't be installed; raises whatever the POST
+        raises. Shared by the scheduled poll and the health loop's catch-up
+        (`_on_healthy`)."""
+        lease_id_before = self._lease_id
+        new = await self._post_poll_token()
+
+        # A health-driven swap may have rotated us onto a different
+        # lease/account while this poll was in flight. The token we
+        # just fetched belongs to the OLD lease; writing it onto the
+        # NEW account's shared credentials file would clobber the swap.
+        if self._lease_id != lease_id_before:
+            return False
+
+        new_access = new.get("access_token")
+        new_exp = float(new.get("token_expires_at") or 0.0)
+        if not new_access or not new_exp:
+            # Field names only: the body carries the access token.
+            log.warning("lease token poll returned an incomplete "
+                        "response (fields: %s)", sorted(new))
+            return False
+
+        # Rewrite shared .credentials.json with the new access_token
+        # (keep existing refresh_token + scopes + subscriptionType).
+        try:
+            _patch_access_token(self._dir, new_access, new_exp)
+        except OSError as e:
+            log.warning("failed to update .credentials.json: %s", e)
+            return False
+
+        self._token_expires_at = new_exp
+        log.debug(
+            "rotated access_token for lease %s (exp=%s)",
+            self._lease_id, new_exp,
+        )
+        return True
 
     async def _post_poll_token(self) -> dict:
         assert self._lease_id is not None
@@ -457,6 +468,7 @@ class PooledClient(ClaudeSDKClient):
         watcher = HealthWatcher(
             fetch=self._fetch_health,
             on_unhealthy=self._on_unhealthy,
+            on_healthy=self._on_healthy,
             interval_s=self._health_interval_s,
         )
         try:
@@ -494,6 +506,27 @@ class PooledClient(ClaudeSDKClient):
                   "maintenance", status)
         for t in tasks:
             t.cancel()
+
+    async def _on_healthy(self, health: dict) -> None:
+        """The account is fine, but the pool may have rotated its token —
+        every lease on it shares one — revoking the copy in our credentials
+        file. Nothing else would notice: the SDK's output is never watched
+        for 401s, and the scheduled poll sleeps until OUR token's expiry."""
+        if self._dir is None or self._lease_id is None:
+            return
+        ours = {"lease_id": self._lease_id,
+                "token_expires_at": self._token_expires_at}
+        if not token_is_stale(ours, health):
+            return
+        log.info("pool rotated %s's token; pulling the current one",
+                 self._lease_account)
+        try:
+            await self._pull_token()
+        except PoolAuthError:
+            return  # key rejected; _on_key_rejected stopped maintenance
+        except Exception as e:  # noqa: BLE001
+            # The next health tick sees the same mismatch and tries again.
+            log.warning("pulling the rotated token failed: %s", e)
 
     async def _on_unhealthy(self, health: dict) -> None:
         await self._swap_account(

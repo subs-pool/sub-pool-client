@@ -35,6 +35,7 @@ class HealthWatcher:
         *,
         fetch: Callable[[], Awaitable[dict[str, Any]]],
         on_unhealthy: Callable[[dict[str, Any]], Awaitable[None]],
+        on_healthy: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         interval_s: float = 30.0,
     ):
         # `fetch` is a no-argument coroutine that returns the health dict
@@ -43,6 +44,9 @@ class HealthWatcher:
         # in place via a small mutable container).
         self._fetch = fetch
         self._on_unhealthy = on_unhealthy
+        # Sees every healthy answer, for fields beyond the verdict (the CLI
+        # uses `token_expires_at` to catch a token rotated out from under it).
+        self._on_healthy = on_healthy
         self._interval_s = interval_s
 
     async def run(self) -> None:
@@ -112,6 +116,13 @@ class HealthWatcher:
 
             reacquires = 0
             if data.get("healthy"):
+                if self._on_healthy is not None:
+                    try:
+                        await self._on_healthy(data)
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("on_healthy handler raised: %s", e)
                 continue
 
             try:

@@ -177,6 +177,32 @@ def next_refresh_sleep(
     return anchored if anchored > min_sleep_s else jittered(min_sleep_s)
 
 
+def token_is_stale(lease: dict, health: dict) -> bool:
+    """Has the pool moved this lease's account onto a different token?
+
+    Reads `token_expires_at` off a `/health` answer — the expiry of the
+    account's CURRENT token. Every lease on an account shares that token, so
+    when anything pool-side rotates it (another lease's near-expiry poll, the
+    usage probe recovering from a 401) the copy this lease holds is revoked
+    while the account itself stays healthy. A rotation always moves the
+    expiry, which is how we notice.
+
+    False when the answer is about another lease (a swap raced the probe) or
+    carries no expiry: a pool that predates the field, or a provider the pool
+    deliberately leaves it out for because its /token rotates on every call.
+    """
+    if health.get("lease_id") != lease.get("lease_id"):
+        return False
+    pool_exp = health.get("token_expires_at")
+    if (isinstance(pool_exp, bool) or not isinstance(pool_exp, (int, float))
+            or pool_exp <= 0):
+        return False
+    ours = float(lease.get("token_expires_at") or 0.0)
+    # Slack for a float that has crossed JSON twice; two distinct tokens are
+    # minted seconds apart at the very least.
+    return abs(float(pool_exp) - ours) > 1.0
+
+
 def dir_key(
     *,
     pool_url: str,
