@@ -14,6 +14,9 @@ Symmetric to `PooledClient` for claude:
   - On a backend error (consumer-detected 429 / auth_expired from
     upstream OpenAI), the caller can call `report_error(code, msg)`
     so the pool cools the account and routes other leases elsewhere.
+  - The final release reports the shared session's token usage: every
+    holder's codex writes its rollouts into this one CODEX_HOME, so the
+    last holder out reads them all back (`_usage.CodexRollouts`).
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from sub_pool_client import _usage
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
     LeaseRequestId,
@@ -99,6 +103,9 @@ class PooledCodexClient:
         self._lease_account_id: int | None = None
         self._lease_request_id: str | None = None
         self._token_expires_at: float = 0.0
+        # Fallback start of the shared session for a meta.json written by an
+        # older client, which has no `started_at`.
+        self._entered_at: float = 0.0
 
         self._poll_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
@@ -120,6 +127,7 @@ class PooledCodexClient:
         )
         await sweep_stale_dirs_once()
         self._dir = shared_dir(key)
+        self._entered_at = time.time()
         await self._join_or_acquire_lease()
         if self._is_poll_leader:
             self._start_leader_tasks()
@@ -293,6 +301,9 @@ class PooledCodexClient:
                 meta.token_expires_at = self._token_expires_at
                 meta.holders = [my_pid]
                 meta.poll_leader = my_pid
+                # Dates the shared session: rollouts are only read from here on.
+                meta.started_at = time.time()
+                meta.usage = None
                 self._is_poll_leader = True
         except BaseException:
             if new_lease_id is not None:
@@ -305,6 +316,7 @@ class PooledCodexClient:
         my_pid = os.getpid()
         last_out = False
         lease_id_to_release: str | None = None
+        since = 0.0
         async with locked_meta(self._dir) as meta:
             if meta.holders:
                 try:
@@ -318,10 +330,16 @@ class PooledCodexClient:
                 meta.poll_leader = None
             if not meta.holders:
                 lease_id_to_release = meta.lease_id
+                since = meta.started_at or self._entered_at
                 last_out = True
 
         if last_out and lease_id_to_release is not None:
-            await self._delete_lease(lease_id_to_release, exc)
+            # Before cleanup_dir: the rollouts live in this CODEX_HOME, which
+            # is the shared session's alone — so all of them are its usage.
+            usage = await _usage.collect(_usage.CodexRollouts(
+                self._dir, since, exclusive=True,
+            ).total)
+            await self._delete_lease(lease_id_to_release, exc, usage=usage)
             cleanup_dir(self._dir)
 
     async def _heartbeat_loop(self, interval_s: float = 30.0) -> None:
@@ -624,11 +642,16 @@ class PooledCodexClient:
 
     async def _delete_lease(
         self, lease_id: str, exc: BaseException | None,
+        usage: dict | None = None,
     ) -> None:
+        """`usage` only on the shared session's final release, never a swap's."""
         body: dict[str, Any] = {}
         if exc is not None:
             body["error_code"] = type(exc).__name__
             body["error_message"] = str(exc)[:2000]
+        wire = _usage.to_wire(usage)
+        if wire is not None:
+            body["usage"] = wire
         # Never raises into a swap / release path (the reaper is the backstop).
         await release_lease(lambda: self._http.request(
             "DELETE",

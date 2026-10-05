@@ -17,9 +17,10 @@ Coordination rules:
   pool; later arrivers join (refcount via list length). Dead pids are
   filtered on every meta mutation so a crash doesn't leak a slot forever.
 
-- When `holders` goes empty, the last holder reads `.credentials.json`
-  (possibly rotated by the CLI mid-run) and posts it back to the pool as
-  `updated_credentials` on DELETE, then removes the dir.
+- When `holders` goes empty, the last holder releases the lease and removes
+  the dir. That release reports the shared lease's token usage (see
+  `_usage`): each departing holder adds its own into meta.json's `usage`, so
+  the last one out sends everyone's.
 
 - Dirs are 0700 and every file in them 0600. A dir left behind by a crash
   is removed by `sweep_stale_dirs` once it is old and all its holders are
@@ -255,9 +256,16 @@ class Meta:
     # Persisted so a promoted leader schedules its token poll off the CURRENT
     # lease, not the one it originally joined (a health swap advances this).
     token_expires_at: float = 0.0
+    # When the first holder took the lease (epoch seconds). Survives health
+    # swaps: it dates the shared session, which is what usage is reported for.
+    started_at: float = 0.0
+    # Token usage (a `_usage` tally) of the holders that already left; the
+    # last one out adds its own and reports the sum on the final release.
+    usage: dict | None = None
 
     @classmethod
     def from_json(cls, d: dict) -> "Meta":
+        usage = d.get("usage")
         return cls(
             lease_id=d.get("lease_id"),
             holders=list(d.get("holders") or []),
@@ -265,6 +273,8 @@ class Meta:
             account=d.get("account"),
             account_id=d.get("account_id"),
             token_expires_at=float(d.get("token_expires_at") or 0.0),
+            started_at=float(d.get("started_at") or 0.0),
+            usage=usage if isinstance(usage, dict) else None,
         )
 
     def to_json(self) -> dict:
@@ -275,6 +285,8 @@ class Meta:
             "account": self.account,
             "account_id": self.account_id,
             "token_expires_at": self.token_expires_at,
+            "started_at": self.started_at,
+            "usage": self.usage,
         }
 
 

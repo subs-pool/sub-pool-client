@@ -19,11 +19,11 @@ The pool is a credential broker, not a request proxy. This client:
      native CC uses for its own multi-process coordination.
 
   3. `__aexit__`:
-       - flocks + removes our pid from holders
-       - if holders now empty: read current .credentials.json (CLI may
-         have rotated refresh_token mid-run), DELETE lease to pool with
-         `updated_credentials=<bundle>` so the pool's refresh chain
-         stays continuous, then rmtree the shared dir.
+       - flocks + removes our pid from holders, adding this holder's token
+         usage (from the ResultMessages it received) to the shared tally
+       - if holders now empty: DELETE the lease to the pool carrying that
+         tally as `usage` — one report for the whole shared session — then
+         rmtree the shared dir.
 
 The `CLAUDE_CODE_OAUTH_TOKEN` env-var approach is gone. `CLAUDE_CONFIG_DIR`
 is what the CLI writes/reads, and that's what we share.
@@ -45,11 +45,17 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
+import claude_agent_sdk
 import httpx
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore
+from claude_agent_sdk import (  # type: ignore
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+)
 
+from sub_pool_client import _usage
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
     LeaseRequestId,
@@ -73,6 +79,10 @@ from sub_pool_client.errors import (
 )
 
 log = logging.getLogger(__name__)
+
+# Announces a mid-session `/clear`. Absent from older SDKs; the zeroed totals
+# are then still caught as a counter going backwards (see _usage.ClaudeResults).
+_ConversationReset = getattr(claude_agent_sdk, "ConversationResetMessage", None)
 
 
 class PooledClient(ClaudeSDKClient):
@@ -112,6 +122,16 @@ class PooledClient(ClaudeSDKClient):
         # Caller-supplied options are never mutated; we copy to attach env.
         self._base_options = copy.copy(options) if options else ClaudeAgentOptions()
         self._base_options.env = dict(self._base_options.env or {})
+
+        # Token usage of this holder's SDK session, read off the ResultMessages
+        # it receives (see receive_messages). A resumed / forked session's
+        # first result carries turns an earlier session already reported.
+        self._resumed = bool(
+            getattr(self._base_options, "resume", None)
+            or getattr(self._base_options, "continue_conversation", False)
+            or getattr(self._base_options, "fork_session", False)
+        )
+        self._usage = _usage.ClaudeResults(resumed=self._resumed)
 
         # HTTP client for lease + release
         self._owned_http = http_client is None
@@ -207,6 +227,32 @@ class PooledClient(ClaudeSDKClient):
         if self._owned_http:
             await self._http.aclose()
 
+    async def receive_messages(self) -> AsyncIterator[Any]:
+        """`ClaudeSDKClient.receive_messages`, noting each ResultMessage's
+        usage on the way past (`receive_response` reads through here too).
+        Only what the caller consumes is seen: a result nobody reads isn't
+        counted."""
+        async for message in ClaudeSDKClient.receive_messages(self):
+            try:
+                if isinstance(message, ResultMessage):
+                    self._usage.observe_message(message)
+                elif _ConversationReset and isinstance(message, _ConversationReset):
+                    self._usage.reset()
+            except Exception as e:  # noqa: BLE001
+                log.debug("usage: message not counted (%s)", e)
+            yield message
+
+    def _take_usage(self) -> dict | None:
+        """This holder's usage, handed over once: re-entering the client
+        starts a fresh SDK session, which must not report this one again."""
+        tracker = self._usage
+        self._usage = _usage.ClaudeResults(resumed=self._resumed)
+        try:
+            return tracker.total()
+        except Exception as e:  # noqa: BLE001
+            log.debug("usage: tally failed (%s)", e)
+            return None
+
     # ============================================================ lease state
     async def _join_or_acquire_lease(self) -> None:
         assert self._dir is not None
@@ -263,6 +309,9 @@ class PooledClient(ClaudeSDKClient):
                 meta.token_expires_at = self._token_expires_at
                 meta.holders = [my_pid]
                 meta.poll_leader = my_pid
+                # A new shared session: drop a crashed predecessor's tally.
+                meta.started_at = time.time()
+                meta.usage = None
                 self._is_first_holder = True
                 self._is_poll_leader = True
         except BaseException:
@@ -276,6 +325,8 @@ class PooledClient(ClaudeSDKClient):
         my_pid = os.getpid()
         last_out = False
         lease_id_to_release: str | None = None
+        mine = self._take_usage()
+        usage: dict | None = None
 
         async with locked_meta(self._dir) as meta:
             if meta.holders:
@@ -286,6 +337,9 @@ class PooledClient(ClaudeSDKClient):
                     meta.holders.remove(my_pid)
                 except ValueError:
                     pass
+            # Every holder runs its own SDK session on the one lease; the
+            # shared tally is how the last one out reports them all.
+            meta.usage = _usage.merge(meta.usage, mine)
             # If we were the poll leader, hand leadership off. The next
             # heartbeat in a surviving holder will elect itself and start
             # its own poll_loop. Guard on self._is_poll_leader: with two
@@ -297,10 +351,11 @@ class PooledClient(ClaudeSDKClient):
                 meta.poll_leader = None
             if not meta.holders:
                 lease_id_to_release = meta.lease_id
+                usage = meta.usage
                 last_out = True
 
         if last_out and lease_id_to_release is not None:
-            await self._delete_lease(lease_id_to_release, exc)
+            await self._delete_lease(lease_id_to_release, exc, usage=usage)
             cleanup_dir(self._dir)
 
     # ============================================================ heartbeat
@@ -678,11 +733,16 @@ class PooledClient(ClaudeSDKClient):
 
     async def _delete_lease(
         self, lease_id: str, exc: BaseException | None,
+        usage: dict | None = None,
     ) -> None:
+        """`usage` only on the shared session's final release, never a swap's."""
         body: dict[str, Any] = {}
         if exc is not None:
             body["error_code"] = type(exc).__name__
             body["error_message"] = str(exc)[:2000]
+        wire = _usage.to_wire(usage)
+        if wire is not None:
+            body["usage"] = wire
         await release_lease(lambda: self._http.request(
             "DELETE",
             f"{self._pool_url}/credentials/lease/{lease_id}",

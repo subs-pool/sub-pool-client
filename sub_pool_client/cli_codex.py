@@ -17,6 +17,9 @@ While the session is alive `$CODEX_HOME/auth.json` is kept current —
 token rotations and mid-session account swaps happen transparently in
 the background, so the leased account stays in rotation across long
 runs.
+
+When it ends, the lease release reports the session's token usage,
+read back from codex's rollout files (see `_usage.CodexRollouts`).
 """
 from __future__ import annotations
 

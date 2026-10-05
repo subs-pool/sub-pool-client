@@ -28,6 +28,11 @@ behaviour from before this existed.
 While the session is alive the credentials file in `CLAUDE_CONFIG_DIR`
 is kept current — token rotations and mid-session account swaps
 happen transparently in the background.
+
+When it ends, the lease release reports what the session consumed:
+from claude's result lines when stdout is `--output-format json` /
+`stream-json`, otherwise from the session's own transcripts (see
+`_usage`).
 """
 from __future__ import annotations
 

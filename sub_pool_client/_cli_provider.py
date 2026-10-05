@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from sub_pool_client import _usage
+
 
 def _write_claude_credentials(path: Path, lease: dict) -> None:
     """Write `.credentials.json` in the shape the `claude` CLI reads.
@@ -157,6 +159,10 @@ class CliProvider:
     # symlinks get laid down. Used by Claude to seed a no-onboarding
     # `.claude.json`; Codex doesn't need it.
     init_home: Callable[[Path], None] | None = None
+    # Builds the per-session usage collector from the passthrough args (see
+    # `_usage.SessionUsage`); its tally rides on the session's final release.
+    # None: the provider reports no usage.
+    usage: Callable[[tuple[str, ...]], "_usage.SessionUsage"] | None = None
 
 
 CLAUDE = CliProvider(
@@ -174,6 +180,7 @@ CLAUDE = CliProvider(
     lease_body_extras={},
     write_credentials=_write_claude_credentials,
     init_home=_seed_claude_home,
+    usage=_usage.ClaudeCliUsage,
 )
 
 
@@ -187,6 +194,7 @@ CODEX = CliProvider(
     bypass_env_vars=("OPENAI_API_KEY",),
     lease_body_extras={"provider": "codex"},
     write_credentials=_write_codex_auth,
+    usage=_usage.CodexCliUsage,
 )
 
 

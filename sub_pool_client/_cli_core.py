@@ -24,7 +24,7 @@ from typing import Any, Callable
 import click
 import httpx
 
-from sub_pool_client import _auth_watch
+from sub_pool_client import _auth_watch, _usage
 from sub_pool_client._cli_provider import CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
@@ -366,9 +366,16 @@ class PoolHTTP:
         r.raise_for_status()
         return r.json()
 
-    async def release(self, lease_id: str) -> None:
+    async def release(self, lease_id: str, usage: dict | None = None) -> None:
+        """End a lease. `usage` (a `_usage` tally) goes only on the session's
+        final release — a swap's release carries none, so a session reports
+        once however many accounts it went through."""
+        body: dict[str, Any] = {}
+        wire = _usage.to_wire(usage)
+        if wire is not None:
+            body["usage"] = wire
         await release_lease(lambda: self._send(
-            "DELETE", f"/credentials/lease/{lease_id}", json={},
+            "DELETE", f"/credentials/lease/{lease_id}", json=body,
         ), lease_id)
 
     async def health(self, lease_id: str) -> dict:
@@ -556,6 +563,9 @@ async def run_session(
     # at by then (a swap may have advanced it), however the session ends —
     # including a failure before the child ever starts (e.g. a missing binary).
     current: dict | None = None
+    # What the session consumed, for that final release only. Stays None when
+    # it can't be worked out (see _usage), which sends no `usage` at all.
+    usage: dict | None = None
     try:
         try:
             lease = await pool.lease(
@@ -598,10 +608,13 @@ async def run_session(
             # catches a token the pool rotated out from under us.
             watch_output = _auth_watch.should_watch()
             _pipe = asyncio.subprocess.PIPE if watch_output else None
+            started_at = time.time()
             proc = await asyncio.create_subprocess_exec(
                 bin_path, *prompt_args, env=env,
                 stdout=_pipe, stderr=_pipe,
             )
+            meter = _start_usage(provider, prompt_args, session_dir=session_dir,
+                                 pid=proc.pid, started_at=started_at)
 
             # Forward common signals so Ctrl-C reaches the child. Record
             # which handlers we installed so the finally block can
@@ -718,6 +731,10 @@ async def run_session(
             # instead of spawning a task per line.
             aux: list[asyncio.Task] = []
             pumps: list[asyncio.Task] = []
+            if meter is not None:
+                aux.append(asyncio.create_task(
+                    _poll_usage(meter), name=f"sp-{provider.name}-usage",
+                ))
             if watch_output:
                 async def _auth_report(code: str, message: str) -> None:
                     await pool.report_error(
@@ -739,6 +756,11 @@ async def run_session(
                     if _auth_watch.looks_like_auth_failure(line):
                         with suppress(asyncio.QueueFull):
                             signals.put_nowait(line)
+                    if meter is not None:
+                        try:
+                            meter.on_line(line)
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("usage line hook raised (ignored): %s", e)
 
                 async def _consume_signals() -> None:
                     while True:
@@ -789,6 +811,13 @@ async def run_session(
                             asyncio.gather(*pumps, return_exceptions=True),
                             timeout=5.0,
                         )
+                # Before the finally below removes session_dir: the claude
+                # transcripts are read through it.
+                if meter is not None:
+                    usage = await _usage.collect(meter.total)
+                    if verbose and usage is not None:
+                        log.info("session usage: %d in / %d out tokens",
+                                 usage["input_tokens"], usage["output_tokens"])
             finally:
                 for sig in installed_signals:
                     with suppress(NotImplementedError, RuntimeError):
@@ -808,8 +837,35 @@ async def run_session(
         return exit_code
     finally:
         if current is not None:
-            await pool.release(current["lease"]["lease_id"])
+            await pool.release(current["lease"]["lease_id"], usage=usage)
         await pool.aclose()
+
+
+def _start_usage(
+    provider: CliProvider, args: tuple[str, ...], *, session_dir: Path,
+    pid: int, started_at: float,
+) -> "_usage.SessionUsage | None":
+    """The provider's usage collector, started on the spawned child — or None
+    when it has none or it fails to start (no report, nothing else lost)."""
+    if provider.usage is None:
+        return None
+    try:
+        meter = provider.usage(args)
+        meter.start(config_dir=session_dir, pid=pid, started_at=started_at,
+                    cwd=os.getcwd())
+        return meter
+    except Exception as e:  # noqa: BLE001
+        log.debug("usage collection not started: %s", e)
+        return None
+
+
+async def _poll_usage(meter: "_usage.SessionUsage") -> None:
+    while True:
+        await asyncio.sleep(_usage.POLL_INTERVAL_S)
+        try:
+            meter.poll()
+        except Exception as e:  # noqa: BLE001
+            log.debug("usage poll raised (ignored): %s", e)
 
 
 def _forward(proc: asyncio.subprocess.Process, sig: int) -> None:
