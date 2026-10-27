@@ -1,4 +1,4 @@
-"""Per-provider knobs for the sp-claude / sp-codex / sp-grok CLIs.
+"""Per-provider knobs for the sp-claude / sp-codex / sp-grok / sp-muse CLIs.
 
 The lease loop in `_cli_core` is provider-agnostic — same lease /
 refresh / release flow regardless of which upstream CLI gets spawned.
@@ -77,6 +77,72 @@ def _write_codex_auth(path: Path, lease: dict) -> None:
     _atomic_write_json(path, auth)
 
 
+def _write_nothing(path: Path, lease: dict) -> None:
+    """muse reads its credential from the environment, not a file — see
+    `_muse_env`. Writing the api_key to disk anyway would only add a copy to
+    clean up."""
+    del path, lease
+
+
+def _muse_auth(lease: dict) -> dict:
+    creds = lease.get("credentials") or {}
+    auth = creds.get("auth_json") if isinstance(creds, dict) else None
+    return auth if isinstance(auth, dict) else {}
+
+
+def _muse_key(lease: dict) -> str:
+    key = _muse_auth(lease).get("api_key")
+    if not isinstance(key, str) or not key:
+        raise RuntimeError("lease response did not include a Muse api_key")
+    return key
+
+
+def _muse_env(lease: dict) -> dict[str, str]:
+    """`META_API_KEY` for the spawned `muse` — the no-proxy fallback.
+
+    The pool hands out the api_key (never Meta's access_token — that stays
+    server-side), and muse documents `META_API_KEY` as winning over any
+    logged-in session, so a local `muse login` can't shadow the lease.
+    """
+    return {"META_API_KEY": _muse_key(lease)}
+
+
+_MUSE_DEFAULT_BASE = "https://api.meta.ai/v1"
+
+
+def _muse_origin(lease: dict) -> str:
+    from sub_pool_client._api_proxy import origin_of_base_url
+    return origin_of_base_url(
+        _muse_auth(lease).get("base_url") or lease.get("base_url"),
+        _MUSE_DEFAULT_BASE)
+
+
+def _muse_user_base_url(args: tuple[str, ...]) -> bool:
+    """Did the user point muse somewhere themselves? Then we don't proxy —
+    theirs wins, and the session falls back to no mid-session swap."""
+    return any(a == "--base-url" or a.startswith("--base-url=") for a in args)
+
+
+def _muse_quota_body(status: int, body: bytes) -> bool:
+    """Is this upstream 429 a spent SUBSCRIPTION (swap-worthy) rather than a
+    short rate limit (muse's own backoff is right for that)?"""
+    return status == 429 and b"quota exhausted" in body.lower()
+
+
+def _muse_quota_exhausted(line: str) -> bool:
+    """Does this stderr line say muse's subscription quota ran out?
+
+    Verified shape (`muse exec`, 1.4.13):
+        API error 429 [request_id=…]: Subscription quota exhausted. Your usage
+        window resets at 2026-11-02T00:00:00Z. (rate_limit_error)
+    Matched on the two transport-level fragments, never on prose alone — the
+    pool parses the reset time out of the same line.
+    """
+    low = line.lower()
+    return "api error 429" in low and (
+        "rate_limit_error" in low or "quota exhausted" in low)
+
+
 def _seed_claude_home(home: Path) -> None:
     """Pre-write a minimal `.claude.json` so Claude Code's first-run
     onboarding wizard does not appear inside the leased REPL.
@@ -121,14 +187,33 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 
 
 @dataclass(frozen=True)
+class ApiProxySpec:
+    """How to put a `_api_proxy.KeySwappingProxy` in front of a CLI whose
+    credential is fixed in its environment, so it can still swap accounts."""
+
+    # proxy origin (`http://127.0.0.1:N`) -> args prepended to the CLI's own
+    args_for: Callable[[str], tuple[str, ...]]
+    # the user's args already redirect the CLI → don't proxy
+    opted_out: Callable[[tuple[str, ...]], bool]
+    # per-session local secret -> env for the child
+    env_for: Callable[[str], dict[str, str]]
+    # lease -> the real key / upstream origin the proxy forwards with
+    key_of: Callable[[dict], str]
+    origin_of: Callable[[dict], str]
+    # (status, body) -> is this a spent-quota answer worth a swap
+    quota_exhausted: Callable[[int, bytes], bool]
+
+
+@dataclass(frozen=True)
 class CliProvider:
     name: str
     # Default binary name resolved from PATH; overridable via CLI flag /
     # cli.toml.
     default_bin: str
     # Environment variable the spawned binary uses to locate its config
-    # dir. The CLI sets this to the per-session temp dir.
-    config_dir_env: str
+    # dir. The CLI sets this to the per-session temp dir. None: the binary
+    # isn't redirected (its credential arrives via `credential_env`).
+    config_dir_env: str | None
     # Name of the credentials file written into the per-session dir.
     cred_filename: str
     # File-name prefixes that are per-session and must NOT be symlinked
@@ -163,6 +248,25 @@ class CliProvider:
     # `_usage.SessionUsage`); its tally rides on the session's final release.
     # None: the provider reports no usage.
     usage: Callable[[tuple[str, ...]], "_usage.SessionUsage"] | None = None
+    # Extra env for the child, derived from the lease at spawn. For a CLI
+    # that takes its credential from the environment (muse) rather than a
+    # file. Env is fixed for the child's lifetime, so such a provider can't
+    # pick up a swapped or rotated credential mid-session — see `live_swap`.
+    credential_env: Callable[[dict], dict[str, str]] | None = None
+    # Can a mid-session swap actually reach the running child? True wherever
+    # the credential is a file the CLI re-reads. False for an env-borne one:
+    # swapping the lease underneath would move the pool's bookkeeping to a
+    # new account while the child keeps spending the old one.
+    live_swap: bool = True
+    # stderr line -> "upstream says this account's quota is spent". When it
+    # matches, the line is reported to the pool (once per lease) so the
+    # account cools until the reset time the line names. None: not watched.
+    # Only used when `api_proxy` isn't active (the proxy sees the 429 first).
+    quota_exhausted: Callable[[str], bool] | None = None
+    # Route the CLI's API traffic through a local key-swapping proxy. With
+    # it active the session CAN swap (the proxy reads the current lease per
+    # request), overriding `live_swap`.
+    api_proxy: ApiProxySpec | None = None
 
 
 CLAUDE = CliProvider(
@@ -218,7 +322,43 @@ GROK = CliProvider(
 )
 
 
-_PROVIDERS = {p.name: p for p in (CLAUDE, CODEX, GROK)}
+MUSE = CliProvider(
+    name="muse",
+    default_bin="muse",
+    # A per-session dir is still laid out (the engine is uniform), but muse
+    # isn't pointed at it: its credential comes from META_API_KEY, and its
+    # own config/history stay where the user's muse keeps them.
+    config_dir_env=None,
+    cred_filename="lease.json",
+    cred_skip_prefixes=("lease.json",),
+    home_subdir="muse-home",
+    # Set by `_muse_env` from the lease; any ambient value is dropped first so
+    # the user's own key can never be what the child bills.
+    bypass_env_vars=("META_API_KEY",),
+    lease_body_extras={"provider": "muse"},
+    write_credentials=_write_nothing,
+    # Fallback (user passed their own --base-url): the real key by env, no
+    # swap, 429s scraped off stderr.
+    credential_env=_muse_env,
+    live_swap=False,
+    quota_exhausted=_muse_quota_exhausted,
+    # Normal path: `--base-url` at the loopback proxy (verified on muse
+    # 1.4.13 for both the TUI and `exec`; plain http to loopback is
+    # accepted), with a per-session secret as META_API_KEY. Telemetry still
+    # goes straight to api.meta.ai carrying that secret — it's meaningless
+    # off this machine, and the 401 it earns there is harmless.
+    api_proxy=ApiProxySpec(
+        args_for=lambda origin: ("--base-url", f"{origin}/v1"),
+        opted_out=_muse_user_base_url,
+        env_for=lambda secret: {"META_API_KEY": secret},
+        key_of=_muse_key,
+        origin_of=_muse_origin,
+        quota_exhausted=_muse_quota_body,
+    ),
+)
+
+
+_PROVIDERS = {p.name: p for p in (CLAUDE, CODEX, GROK, MUSE)}
 
 
 def get_provider(name: str) -> CliProvider:

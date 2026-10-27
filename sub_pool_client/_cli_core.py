@@ -24,7 +24,7 @@ from typing import Any, Callable
 import click
 import httpx
 
-from sub_pool_client import _auth_watch, _usage
+from sub_pool_client import _api_proxy, _auth_watch, _usage
 from sub_pool_client._cli_provider import CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
@@ -595,9 +595,46 @@ async def run_session(
             )
 
             env = os.environ.copy()
-            env[provider.config_dir_env] = str(session_dir)
+            if provider.config_dir_env is not None:
+                env[provider.config_dir_env] = str(session_dir)
             for k in provider.bypass_env_vars:
                 env.pop(k, None)
+            # A CLI whose credential is fixed in its env gets a loopback
+            # key-swapping proxy in front of its API traffic (see _api_proxy),
+            # unless the user already redirected it themselves.
+            spec = provider.api_proxy
+            proxy: "_api_proxy.KeySwappingProxy | None" = None
+            child_args = tuple(prompt_args)
+            swap_ready = asyncio.Event()
+            if spec is not None and not spec.opted_out(child_args):
+                async def _proxy_swap_from(lease_id: str, reason: str) -> None:
+                    await swap_ready.wait()
+                    async with swap_lock:
+                        if current["lease"]["lease_id"] != lease_id:
+                            return  # a concurrent request already moved us
+                        await _do_swap({"reason": reason})
+
+                async def _proxy_report(lease_id: str, code: str, message: str) -> None:
+                    await pool.report_error(lease_id, code, message)
+
+                proxy = _api_proxy.KeySwappingProxy(
+                    current, key_of=spec.key_of, origin_of=spec.origin_of,
+                    swap_from=_proxy_swap_from, report=_proxy_report,
+                    quota_exhausted=spec.quota_exhausted,
+                )
+                origin = await proxy.start()
+                child_args = (*spec.args_for(origin), *child_args)
+                if verbose:
+                    log.info("api proxy on %s", origin)
+            # Can a swap reach the running child? Through the proxy, yes.
+            live_swap = provider.live_swap or proxy is not None
+
+            # After the bypass strip, so a credential the lease supplies by
+            # env isn't immediately removed again.
+            if proxy is not None:
+                env.update(spec.env_for(proxy.secret))
+            elif provider.credential_env is not None:
+                env.update(provider.credential_env(lease))
 
             # Watching the child's output is what catches an upstream auth
             # failure the pool cannot see (a revoked access token on a
@@ -609,10 +646,15 @@ async def run_session(
             watch_output = _auth_watch.should_watch()
             _pipe = asyncio.subprocess.PIPE if watch_output else None
             started_at = time.time()
-            proc = await asyncio.create_subprocess_exec(
-                bin_path, *prompt_args, env=env,
-                stdout=_pipe, stderr=_pipe,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    bin_path, *child_args, env=env,
+                    stdout=_pipe, stderr=_pipe,
+                )
+            except BaseException:
+                if proxy is not None:
+                    await proxy.aclose()
+                raise
             meter = _start_usage(provider, prompt_args, session_dir=session_dir,
                                  pid=proc.pid, started_at=started_at)
 
@@ -647,6 +689,15 @@ async def run_session(
             swap_lock = asyncio.Lock()
 
             async def on_swap_needed(health: dict) -> None:
+                if not live_swap:
+                    # The child's credential is fixed in its env; a swap would
+                    # re-point the lease while it keeps spending the old
+                    # account. Stay put — the pool already knows the state.
+                    if verbose:
+                        log.info("swap skipped: %s can't switch credentials "
+                                 "mid-session (%s)", provider.name,
+                                 (health.get("reason") or "unhealthy")[:80])
+                    return
                 # Read the from-account BEFORE swap_credentials runs —
                 # the call mutates `current["lease"]` in place (that's
                 # what closes the refresh/swap race; see _swap.py).
@@ -682,6 +733,10 @@ async def run_session(
                 except NoSwapAvailable as e:
                     if verbose:
                         log.info("swap deferred: %s", e)
+
+            # The proxy was started before the child (it needs a port to hand
+            # it), so a request can reach it before these swap helpers exist.
+            swap_ready.set()
 
             async def _refresh_now() -> bool:
                 ok = await _refresh_once(
@@ -771,14 +826,58 @@ async def run_session(
                     _consume_signals(), name=f"sp-{provider.name}-authrecover",
                 ))
                 aux.append(maintenance[-1])
-                for stream, sink in (
-                    (proc.stdout, _auth_watch.stdout_sink()),
-                    (proc.stderr, _auth_watch.stderr_sink()),
+
+                # Upstream quota exhaustion, for providers that say so on
+                # stderr. Reported once per lease — the account is cooled
+                # after the first, and repeats would only re-log it — with
+                # the line itself as the message, since it names the reset
+                # time the pool cools until.
+                _on_err_line = _on_line
+                if provider.quota_exhausted is not None and proxy is None:
+                    quota_hits: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+                    detect = provider.quota_exhausted
+
+                    def _on_err_line(line: str) -> None:
+                        _on_line(line)
+                        try:
+                            hit = detect(line)
+                        except Exception:  # noqa: BLE001
+                            hit = False
+                        if hit:
+                            with suppress(asyncio.QueueFull):
+                                quota_hits.put_nowait(line)
+
+                    async def _report_quota() -> None:
+                        reported: set[str] = set()
+                        while True:
+                            line = await quota_hits.get()
+                            lease_id = current["lease"]["lease_id"]
+                            if lease_id in reported:
+                                continue
+                            reported.add(lease_id)
+                            try:
+                                await pool.report_error(
+                                    lease_id, "RateLimit", line.strip()[:500])
+                            except Exception as e:  # noqa: BLE001
+                                log.warning("quota report failed: %s", e)
+                            else:
+                                if verbose:
+                                    log.info("reported quota exhaustion on %s",
+                                             current["lease"].get("account"))
+
+                    maintenance.append(asyncio.create_task(
+                        _report_quota(), name=f"sp-{provider.name}-quota",
+                    ))
+                    aux.append(maintenance[-1])
+
+                for stream, sink, hook in (
+                    (proc.stdout, _auth_watch.stdout_sink(), _on_line),
+                    (proc.stderr, _auth_watch.stderr_sink(), _on_err_line),
                 ):
                     if stream is None:
                         continue
                     t = asyncio.create_task(
-                        _auth_watch.pump(stream, sink, _on_line),
+                        _auth_watch.pump(stream, sink, hook),
                         name=f"sp-{provider.name}-pump",
                     )
                     pumps.append(t)
@@ -830,6 +929,9 @@ async def run_session(
                 for t in (refresher, watcher, *aux):
                     with suppress(asyncio.CancelledError, Exception):
                         await t
+                if proxy is not None:
+                    with suppress(Exception):
+                        await proxy.aclose()
         finally:
             with suppress(Exception):
                 commit_session_to_home(session_dir, home_dir, provider)
