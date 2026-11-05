@@ -41,7 +41,9 @@ import sys
 
 import click
 
-from sub_pool_client._cli_core import run_session, run_setup, run_status
+from sub_pool_client._cli_core import (
+    run_add_key, run_session, run_setup, run_status, run_whoami,
+)
 from sub_pool_client._cli_provider import CLAUDE
 
 
@@ -52,6 +54,12 @@ from sub_pool_client._cli_provider import CLAUDE
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 @click.option("--setup", is_flag=True, help="One-time pool config wizard.")
 @click.option("--status", is_flag=True, help="Show current config + exit.")
+@click.option("--key", "key_name", default=None, metavar="NAME",
+              help="Use the API key saved under NAME in cli.toml (see --add-key).")
+@click.option("--whoami", is_flag=True,
+              help="Show each configured key's sub-pool and whether it can lease from here.")
+@click.option("--add-key", default=None, metavar="NAME",
+              help="Save another API key under NAME (e.g. one per sub-pool).")
 @click.option("--account", default=None,
               help="Bind to a specific account, skipping round-robin order. "
                    "Subject to the api key's strategy eligibility.")
@@ -59,13 +67,17 @@ from sub_pool_client._cli_provider import CLAUDE
               help="Override path to `claude` binary.")
 @click.option("--verbose", is_flag=True,
               help="Print swap / refresh events to stderr.")
-def main(claude_args, setup, status, account, claude_bin, verbose) -> None:
+def main(claude_args, setup, status, key_name, whoami, add_key, account, claude_bin, verbose) -> None:
     if setup:
         sys.exit(run_setup(CLAUDE))
     if status:
-        sys.exit(run_status(CLAUDE))
+        sys.exit(run_status(CLAUDE, key_name))
+    if whoami:
+        sys.exit(run_whoami(CLAUDE, key_name))
+    if add_key:
+        sys.exit(run_add_key(CLAUDE, add_key))
     code = asyncio.run(run_session(
-        CLAUDE, claude_args, account, claude_bin, verbose,
+        CLAUDE, claude_args, account, claude_bin, verbose, key_name,
     ))
     sys.exit(code)
 

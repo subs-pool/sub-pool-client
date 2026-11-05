@@ -45,6 +45,16 @@ log = logging.getLogger("sp")
 # state lives in subdirs named by `CliProvider.home_subdir`.
 SP_ROOT = Path.home() / ".sub-pool"
 CONFIG_PATH = SP_ROOT / "cli.toml"
+DEFAULT_KEY = "default"      # the name of [pool].api_key
+_KEY_NAME_RE = __import__("re").compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
+
+
+class KeyChoiceError(Exception):
+    def __init__(self, name: str, available: list[str]):
+        self.name, self.available = name, available
+        super().__init__(
+            f"no key named {name!r} in {CONFIG_PATH} "
+            f"(configured: {', '.join(available) or 'none'})")
 
 
 # ============================================================ config
@@ -57,7 +67,12 @@ class Config:
 
         [pool]
         url = "https://pool.example.com"
-        api_key = "cp-..."
+        api_key = "cp-..."        # the key used when nothing else is chosen
+        default_key = "home"      # optional: a name from [keys] instead
+
+        [keys]                    # optional named keys — one per sub-pool, say
+        home = "cp-..."
+        travel = "cp-..."
 
         [claude]
         bin = "claude"            # optional, defaults to PATH lookup
@@ -69,13 +84,29 @@ class Config:
 
     Per-provider sections are optional; absent values fall back to
     the provider's `default_bin` and an empty default account.
+
+    Which key a run uses: `--key NAME`, else $SUB_POOL_KEY_NAME, else a raw
+    $SUB_POOL_KEY, else `default_key`, else `api_key`. The name "default"
+    always means `[pool].api_key`. `key_name` records the choice.
     """
 
     def __init__(self, pool_url: str, api_key: str,
-                 per_provider: dict[str, dict[str, str]] | None = None):
+                 per_provider: dict[str, dict[str, str]] | None = None,
+                 *, keys: dict[str, str] | None = None,
+                 default_key: str | None = None, key_name: str = DEFAULT_KEY):
         self.pool_url = pool_url.rstrip("/")
-        self.api_key = api_key
+        self.api_key = api_key          # the key this run uses
         self._per_provider = per_provider or {}
+        self.keys = dict(keys or {})    # named keys from [keys]
+        self.default_key = default_key  # [pool].default_key
+        self.key_name = key_name        # which one api_key is
+        self._base_key = api_key        # [pool].api_key, for write()
+
+    def all_keys(self) -> dict[str, str]:
+        """Every configured key by name, "default" being [pool].api_key."""
+        out = {DEFAULT_KEY: self._base_key} if self._base_key else {}
+        out.update(self.keys)
+        return out
 
     def bin_for(self, provider: CliProvider) -> str:
         return (self._per_provider.get(provider.name, {}).get("bin")
@@ -99,7 +130,7 @@ class Config:
         return existing
 
     @classmethod
-    def load(cls) -> "Config | None":
+    def load(cls, key_name: str | None = None) -> "Config | None":
         """Resolve pool_url + api_key from env vars first, falling back
         to `~/.sub-pool/cli.toml`. Per-provider sections (bin paths /
         default accounts) come from the TOML only — env vars cover the
@@ -108,6 +139,7 @@ class Config:
 
         Returns None only when neither source supplies both pool_url
         AND api_key — that's the "go run --setup" signal in main().
+        Raises KeyChoiceError for a key name that isn't configured.
         """
         env_url = (os.environ.get("SUB_POOL_URL") or "").strip()
         env_key = (os.environ.get("SUB_POOL_KEY") or "").strip()
@@ -119,7 +151,23 @@ class Config:
 
         pool = data.get("pool") or {}
         pool_url = env_url or (pool.get("url") or "")
-        api_key = env_key or (pool.get("api_key") or "")
+        base_key = str(pool.get("api_key") or "")
+        keys = {str(k): str(v) for k, v in (data.get("keys") or {}).items()
+                if isinstance(v, str) and v.strip()}
+        default_key = str(pool.get("default_key") or "") or None
+        named = {DEFAULT_KEY: base_key, **keys} if base_key else dict(keys)
+
+        chosen = key_name or (os.environ.get("SUB_POOL_KEY_NAME") or "").strip() or None
+        if chosen is not None:
+            if chosen not in named:
+                raise KeyChoiceError(chosen, sorted(named))
+            api_key, key_name = named[chosen], chosen
+        elif env_key:
+            api_key, key_name = env_key, "env"
+        elif default_key and default_key in named:
+            api_key, key_name = named[default_key], default_key
+        else:
+            api_key, key_name = base_key, DEFAULT_KEY
         if not pool_url or not api_key:
             return None
 
@@ -131,16 +179,24 @@ class Config:
                     k: str(v) for k, v in section.items()
                     if isinstance(v, (str, int, float))
                 }
-        return cls(pool_url=pool_url, api_key=api_key,
-                   per_provider=per_provider)
+        cfg = cls(pool_url=pool_url, api_key=api_key, per_provider=per_provider,
+                  keys=keys, default_key=default_key, key_name=key_name)
+        cfg._base_key = base_key or (api_key if key_name == "env" else "")
+        return cfg
 
     def write(self) -> None:
         SP_ROOT.mkdir(parents=True, exist_ok=True)
         body = (
             "[pool]\n"
             f"url = {_toml_str(self.pool_url)}\n"
-            f"api_key = {_toml_str(self.api_key)}\n"
+            f"api_key = {_toml_str(self._base_key or self.api_key)}\n"
         )
+        if self.default_key:
+            body += f"default_key = {_toml_str(self.default_key)}\n"
+        if self.keys:
+            body += "\n[keys]\n"
+            for name, key in self.keys.items():
+                body += f"{name} = {_toml_str(key)}\n"
         for name in ("claude", "codex"):
             section = self._per_provider.get(name)
             if not section:
@@ -199,23 +255,120 @@ def run_setup(provider: CliProvider) -> int:
         "bin": (existing.bin_for(provider) if existing else provider.default_bin),
         "default_account": default_account,
     }
-    cfg = Config(pool_url=pool_url, api_key=api_key, per_provider=per_provider)
+    cfg = Config(pool_url=pool_url, api_key=api_key, per_provider=per_provider,
+                 keys=existing.keys if existing else None,
+                 default_key=existing.default_key if existing else None)
     cfg.write()
     click.echo(f"\nWrote {CONFIG_PATH}")
     return 0
 
 
-def run_status(provider: CliProvider) -> int:
-    cfg = Config.load()
+def _load_or_report(provider: CliProvider, key_name: str | None) -> "Config | None":
+    try:
+        cfg = Config.load(key_name)
+    except KeyChoiceError as e:
+        click.echo(f"[sp-{provider.name}] {e}", err=True)
+        return None
     if cfg is None:
-        click.echo(f"No config — run `sp-{provider.name} --setup`", err=True)
+        click.echo(f"No pool config — run `sp-{provider.name} --setup` first.", err=True)
+    return cfg
+
+
+def run_status(provider: CliProvider, key_name: str | None = None) -> int:
+    cfg = _load_or_report(provider, key_name)
+    if cfg is None:
         return 1
     click.echo(f"pool_url      {cfg.pool_url}")
-    click.echo(f"api_key       {cfg.api_key[:12]}…")
+    click.echo(f"api_key       {cfg.api_key[:12]}…  (key: {cfg.key_name})")
+    others = [n for n in cfg.all_keys() if n != cfg.key_name]
+    if others:
+        click.echo(f"other keys    {', '.join(others)}  (pick one with --key NAME)")
     click.echo(f"provider      {provider.name}")
     click.echo(f"binary        {cfg.bin_for(provider)}")
     click.echo(f"default_acct  {cfg.default_account_for(provider) or '(strategy)'}")
     click.echo(f"config_path   {CONFIG_PATH}")
+    return 0
+
+
+def run_add_key(provider: CliProvider, name: str) -> int:
+    """`sp-* --add-key NAME`: store another API key under NAME in cli.toml
+    (prompted, hidden), e.g. one per sub-pool. Use it with `--key NAME`."""
+    if not _KEY_NAME_RE.match(name) or name == DEFAULT_KEY:
+        click.echo("key names are 1-32 letters, digits, '-' or '_' "
+                   f"(and not {DEFAULT_KEY!r})", err=True)
+        return 2
+    cfg = _load_or_report(provider, None)
+    if cfg is None:
+        return 1
+    key = click.prompt(f"API key for {name!r} (cp-...)", hide_input=True).strip()
+    if not key:
+        click.echo("empty key", err=True)
+        return 2
+    cfg.keys[name] = key
+    if click.confirm(f"Use {name!r} by default?", default=False):
+        cfg.default_key = name
+    cfg.write()
+    click.echo(f"Saved {name!r} in {CONFIG_PATH}. Use it with `sp-{provider.name} --key {name}`.")
+    return 0
+
+
+def _whoami_lines(name: str, chosen: bool, r: httpx.Response | None, err: str | None) -> list[str]:
+    mark = "*" if chosen else " "
+    if err is not None:
+        return [f"{mark} {name:10} ✗ {err}"]
+    if r.status_code == 404:
+        return [f"{mark} {name:10} ? the pool is too old for --whoami"]
+    if r.status_code in (401, 403):
+        return [f"{mark} {name:10} ✗ key rejected (revoked, expired or wrong)"]
+    if r.status_code >= 400:
+        return [f"{mark} {name:10} ✗ HTTP {r.status_code}"]
+    d = r.json()
+    pool = d.get("pool") or {}
+    fence = ", ".join(pool.get("allowed_ips") or []) or "any address"
+    verdict = {None: "✓ can lease from here",
+               "ip": f"✗ not from this address (pool allows {fence})",
+               "client_version": "✗ client too old — pip install -U sub-pool-client"}
+    lines = [f"{mark} {name:10} {d['key']['name']!r} in sub-pool {pool.get('name')!r} — "
+             f"{verdict.get(d.get('blocked_by'), d.get('blocked_by'))}",
+             f"  {'':10} new leases from: {fence}"]
+    return lines
+
+
+async def _whoami(cfg: Config, kind: str, names: list[str]) -> list[str]:
+    keys = cfg.all_keys()
+    if cfg.key_name not in keys:          # a raw $SUB_POOL_KEY
+        keys = {cfg.key_name: cfg.api_key, **keys}
+    out: list[str] = []
+    info: dict | None = None
+    async with httpx.AsyncClient(base_url=cfg.pool_url, headers=client_headers(kind),
+                                 timeout=httpx.Timeout(15.0, connect=10.0)) as c:
+        for name in names:
+            try:
+                r = await c.get("/credentials/whoami",
+                                headers={"Authorization": f"Bearer {keys[name]}"})
+                out += _whoami_lines(name, name == cfg.key_name, r, None)
+                if r.status_code == 200 and info is None:
+                    info = r.json()
+            except httpx.HTTPError as e:
+                out += _whoami_lines(name, name == cfg.key_name, None, f"pool unreachable: {e}")
+    if info is not None:
+        cl = info.get("client") or {}
+        out.append(f"your IP {info.get('your_ip')}   client {cl.get('sent') or kind}"
+                   + (f"   minimum {cl['min_version']}" if cl.get("min_version") else ""))
+    return out
+
+
+def run_whoami(provider: CliProvider, key_name: str | None = None) -> int:
+    """`sp-* --whoami`: for every configured key (or just `--key NAME`), which
+    sub-pool it is in, the pool's IP allowlist, and whether a new lease would
+    be allowed from here right now. * marks the key a plain run would use."""
+    cfg = _load_or_report(provider, key_name)
+    if cfg is None:
+        return 1
+    names = [cfg.key_name] if key_name else list(dict.fromkeys(
+        [cfg.key_name, *cfg.all_keys()]))
+    for line in asyncio.run(_whoami(cfg, f"sp-{provider.name}", names)):
+        click.echo(line)
     return 0
 
 
@@ -531,13 +684,10 @@ async def run_session(
     account: str | None,
     bin_override: str | None,
     verbose: bool,
+    key_name: str | None = None,
 ) -> int:
-    cfg = Config.load()
+    cfg = _load_or_report(provider, key_name)
     if cfg is None:
-        click.echo(
-            f"No pool config — run `sp-{provider.name} --setup` first.",
-            err=True,
-        )
         return 2
     try:
         check_pool_url(cfg.pool_url)
