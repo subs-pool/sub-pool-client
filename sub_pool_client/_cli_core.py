@@ -24,6 +24,7 @@ from typing import Any, Callable
 import click
 import httpx
 
+from sub_pool_client._client_id import client_headers
 from sub_pool_client import _api_proxy, _auth_watch, _usage
 from sub_pool_client._cli_provider import CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
@@ -323,11 +324,11 @@ def setup_session_dir(
 
 
 class PoolHTTP:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, kind: str = "sp"):
         self._cfg = cfg
         self._client = httpx.AsyncClient(
             base_url=cfg.pool_url,
-            headers={"Authorization": f"Bearer {cfg.api_key}"},
+            headers={"Authorization": f"Bearer {cfg.api_key}", **client_headers(kind)},
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
         # Covers the initial lease and every swap; see LeaseRequestId.
@@ -558,7 +559,7 @@ async def run_session(
     # would need a re-lease to act on it anyway).
     required_model = model_from_args(prompt_args)
 
-    pool = PoolHTTP(cfg)
+    pool = PoolHTTP(cfg, kind=f"sp-{provider.name}")
     # Set once we hold a lease. The outer finally releases whatever it points
     # at by then (a swap may have advanced it), however the session ends —
     # including a failure before the child ever starts (e.g. a missing binary).

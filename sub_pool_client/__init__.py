@@ -9,7 +9,9 @@ from sub_pool_client.errors import (
     PoolUpstreamError,
 )
 
-__version__ = "0.2.0"
+from sub_pool_client._client_id import client_version as _client_version
+
+__version__ = _client_version()
 __all__ = [
     "PooledClient",
     "PooledCodexClient",

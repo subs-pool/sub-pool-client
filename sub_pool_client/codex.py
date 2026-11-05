@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from sub_pool_client._client_id import client_headers
 from sub_pool_client import _usage
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
@@ -198,7 +199,7 @@ class PooledCodexClient:
         try:
             r = await self._http.post(
                 f"{self._pool_url}/credentials/lease/{lease_id}/report-error",
-                headers={"authorization": f"Bearer {self._api_key}"},
+                headers={"authorization": f"Bearer {self._api_key}", **client_headers("sdk-codex")},
                 json={"code": code, "message": message},
             )
         except Exception as e:  # noqa: BLE001
@@ -446,7 +447,7 @@ class PooledCodexClient:
         assert self._lease_id is not None
         r = await self._http.post(
             f"{self._pool_url}/credentials/lease/{self._lease_id}/token",
-            headers={"authorization": f"Bearer {self._api_key}"},
+            headers={"authorization": f"Bearer {self._api_key}", **client_headers("sdk-codex")},
         )
         if r.status_code in (401, 403):
             self._on_key_rejected(r.status_code)
@@ -485,7 +486,7 @@ class PooledCodexClient:
             return {"healthy": True}
         r = await self._http.get(
             f"{self._pool_url}/credentials/lease/{lease_id}/health",
-            headers={"authorization": f"Bearer {self._api_key}"},
+            headers={"authorization": f"Bearer {self._api_key}", **client_headers("sdk-codex")},
         )
         if r.status_code in (401, 403):
             self._on_key_rejected(r.status_code)
@@ -618,7 +619,7 @@ class PooledCodexClient:
         try:
             r = await self._http.post(
                 f"{self._pool_url}/credentials/lease",
-                headers={"authorization": f"Bearer {self._api_key}"},
+                headers={"authorization": f"Bearer {self._api_key}", **client_headers("sdk-codex")},
                 json=body,
             )
         except (httpx.ConnectError, httpx.ReadTimeout) as e:
@@ -656,7 +657,7 @@ class PooledCodexClient:
         await release_lease(lambda: self._http.request(
             "DELETE",
             f"{self._pool_url}/credentials/lease/{lease_id}",
-            headers={"authorization": f"Bearer {self._api_key}"},
+            headers={"authorization": f"Bearer {self._api_key}", **client_headers("sdk-codex")},
             json=body,
         ), lease_id)
 
