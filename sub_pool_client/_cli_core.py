@@ -25,8 +25,9 @@ import click
 import httpx
 
 from sub_pool_client._client_id import client_headers
-from sub_pool_client import _api_proxy, _auth_watch, _usage
-from sub_pool_client._cli_provider import CliProvider
+from sub_pool_client import _api_proxy, _auth_watch, _cred_guard, _session_log, _usage
+from sub_pool_client._client_id import client_version
+from sub_pool_client._cli_provider import ACCOUNT_VERIFICATION_CODE, CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
     LeaseRequestId,
@@ -710,6 +711,19 @@ async def run_session(
     required_model = model_from_args(prompt_args)
 
     pool = PoolHTTP(cfg, kind=f"sp-{provider.name}")
+    slog_holder: dict = {}
+    slog = _session_log.SessionLog(
+        _session_log.default_path(SP_ROOT, provider.name), provider.name,
+        current=slog_holder,
+    )
+    slog_token = _session_log.CURRENT.set(slog)
+    slog.start(
+        client_version=client_version(), bin_path=bin_path, args=prompt_args,
+        interactive=not any(a in ("-p", "--print") for a in prompt_args),
+        watch_output=_auth_watch.should_watch(),
+        others=_session_log.other_sessions(provider.name),
+        stripped_env=sorted(k for k in provider.bypass_env_vars if k in os.environ),
+    )
     # Set once we hold a lease. The outer finally releases whatever it points
     # at by then (a swap may have advanced it), however the session ends —
     # including a failure before the child ever starts (e.g. a missing binary).
@@ -725,11 +739,18 @@ async def run_session(
             )
         except httpx.HTTPStatusError as e:
             click.echo(_describe_http_error(e, "lease"), err=True)
+            slog.event("lease", result="failed", **_session_log.error_fields(e))
             return 3
         except httpx.HTTPError as e:
             click.echo(f"[sp-{provider.name}] pool unreachable: {e}", err=True)
+            slog.event("lease", result="failed", **_session_log.error_fields(e))
             return 3
         current = {"lease": lease}
+        slog.current = current
+        slog.event(
+            "lease", result="ok", model=required_model,
+            expires_in_s=round(float(lease.get("token_expires_at") or 0) - time.time()),
+        )
         if verbose:
             log.info("leased %s (lease_id=%s)",
                      lease.get("account"), lease.get("lease_id"))
@@ -840,6 +861,8 @@ async def run_session(
             swap_lock = asyncio.Lock()
 
             async def on_swap_needed(health: dict) -> None:
+                slog.event("unhealthy", reason=_session_log.sample(
+                    str(health.get("reason") or "unhealthy")), live_swap=live_swap)
                 if not live_swap:
                     # The child's credential is fixed in its env; a swap would
                     # re-point the lease while it keeps spending the old
@@ -881,9 +904,12 @@ async def run_session(
                             old_account, new.get("account"),
                             (health.get("reason") or "unhealthy")[:80],
                         )
+                    slog.event("swap", result="ok", from_account=old_account,
+                               reason=_session_log.sample(health.get("reason") or "unhealthy"))
                 except NoSwapAvailable as e:
                     if verbose:
                         log.info("swap deferred: %s", e)
+                    slog.event("swap", result="deferred", message=_session_log.sample(str(e)))
 
             # The proxy was started before the child (it needs a port to hand
             # it), so a request can reach it before these swap helpers exist.
@@ -906,6 +932,7 @@ async def run_session(
                 # disk. For an interactive session this is the only recovery:
                 # its output can't be watched for 401s (see _auth_watch).
                 if token_is_stale(current["lease"], health):
+                    slog.event("token_rotated_by_pool")
                     if verbose:
                         log.info("pool rotated %s's token; pulling the "
                                  "current one", current["lease"].get("account"))
@@ -930,6 +957,28 @@ async def run_session(
             # unit if the pool rejects the key.
             maintenance = [refresher, watcher]
 
+            # Keeps the credential file the child reads intact; see
+            # _cred_guard. Local only, so it isn't part of `maintenance`.
+            guard: _cred_guard.CredentialGuard | None = None
+            if (provider.inspect_credentials is not None
+                    and provider.credential_problem is not None):
+                def _rewrite_credentials() -> None:
+                    if not session_dir.is_dir():
+                        session_dir.mkdir(parents=True, exist_ok=True)
+                        setup_session_dir(home_dir, session_dir, provider)
+                    provider.write_credentials(
+                        session_dir / provider.cred_filename, current["lease"],
+                    )
+
+                guard = _cred_guard.CredentialGuard(
+                    path=session_dir / provider.cred_filename,
+                    current=current, provider_name=provider.name,
+                    inspect=provider.inspect_credentials,
+                    problem=provider.credential_problem,
+                    rewrite=_rewrite_credentials,
+                    slog=slog, interval_s=_cred_guard.INTERVAL_S,
+                )
+
             # Output-driven auth recovery. Detection runs in the pumps (sync,
             # non-blocking); the ACTION runs in one consumer task fed by a
             # size-1 queue, so a burst of auth errors — which is what a dead
@@ -937,6 +986,10 @@ async def run_session(
             # instead of spawning a task per line.
             aux: list[asyncio.Task] = []
             pumps: list[asyncio.Task] = []
+            if guard is not None:
+                aux.append(asyncio.create_task(
+                    guard.run(), name=f"sp-{provider.name}-credguard",
+                ))
             if meter is not None:
                 aux.append(asyncio.create_task(
                     _poll_usage(meter), name=f"sp-{provider.name}-usage",
@@ -958,10 +1011,26 @@ async def run_session(
                 )
                 signals: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
 
+                blocked_hits: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
                 def _on_line(line: str) -> None:
+                    if provider.account_blocked is not None:
+                        try:
+                            blocked = provider.account_blocked(line)
+                        except Exception:  # noqa: BLE001
+                            blocked = False
+                        if blocked:
+                            with suppress(asyncio.QueueFull):
+                                blocked_hits.put_nowait(line)
                     if _auth_watch.looks_like_auth_failure(line):
+                        slog.event("auth_signal", sample=_session_log.sample(line))
                         with suppress(asyncio.QueueFull):
                             signals.put_nowait(line)
+                    # Not an upstream rejection — the child can't use the file
+                    # we gave it. Local fix, never the cool-and-swap ladder.
+                    if guard is not None and _cred_guard.looks_like_not_logged_in(line):
+                        slog.event("child_not_logged_in", sample=_session_log.sample(line))
+                        guard.on_child_signal("child_not_logged_in")
                     if meter is not None:
                         try:
                             meter.on_line(line)
@@ -971,12 +1040,44 @@ async def run_session(
                 async def _consume_signals() -> None:
                     while True:
                         sample = await signals.get()
+                        before = len(recovery.history)
                         await recovery.on_signal(sample)
+                        if len(recovery.history) > before:
+                            slog.event("auth_recovery",
+                                       steps=recovery.history[before:],
+                                       attempts=recovery.actions)
 
                 maintenance.append(asyncio.create_task(
                     _consume_signals(), name=f"sp-{provider.name}-authrecover",
                 ))
                 aux.append(maintenance[-1])
+
+                async def _report_blocked() -> None:
+                    # Once per lease: the pool cools the account on the first
+                    # report, and a swap moves us to a new lease anyway.
+                    reported: set[str] = set()
+                    while True:
+                        line = await blocked_hits.get()
+                        lease_id = current["lease"]["lease_id"]
+                        if lease_id in reported:
+                            continue
+                        reported.add(lease_id)
+                        slog.event("account_blocked", sample=_session_log.sample(line))
+                        try:
+                            await pool.report_error(
+                                lease_id, ACCOUNT_VERIFICATION_CODE,
+                                line.strip()[:500])
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("blocked-account report failed: %s", e)
+                        await on_swap_needed({
+                            "reason": "upstream blocked the account "
+                                      "(verification required)"})
+
+                if provider.account_blocked is not None:
+                    maintenance.append(asyncio.create_task(
+                        _report_blocked(), name=f"sp-{provider.name}-blocked",
+                    ))
+                    aux.append(maintenance[-1])
 
                 # Upstream quota exhaustion, for providers that say so on
                 # stderr. Reported once per lease — the account is cooled
@@ -1011,7 +1112,11 @@ async def run_session(
                                     lease_id, "RateLimit", line.strip()[:500])
                             except Exception as e:  # noqa: BLE001
                                 log.warning("quota report failed: %s", e)
+                                slog.event("quota_reported", result="failed",
+                                           **_session_log.error_fields(e))
                             else:
+                                slog.event("quota_reported", result="ok",
+                                           sample=_session_log.sample(line))
                                 if verbose:
                                     log.info("reported quota exhaustion on %s",
                                              current["lease"].get("account"))
@@ -1038,6 +1143,7 @@ async def run_session(
                 # A revoked / expired key fails every call; retrying just
                 # polls a dead key forever. Report once and stop.
                 pool.on_key_rejected = None
+                slog.event("key_rejected", status=status)
                 click.echo(
                     f"[sp-{provider.name}] API key rejected by the pool "
                     f"({status}) — stopping lease maintenance. The session "
@@ -1052,6 +1158,8 @@ async def run_session(
 
             try:
                 exit_code = await proc.wait()
+                slog.event("child_exit", code=exit_code,
+                           duration_s=round(time.time() - started_at, 1))
                 # The child can exit with bytes still in the pipe buffers.
                 # Let the pumps run to EOF so the caller sees every byte,
                 # but never hang the exit on a stuck reader.
@@ -1088,10 +1196,16 @@ async def run_session(
                 commit_session_to_home(session_dir, home_dir, provider)
             shutil.rmtree(session_dir, ignore_errors=True)
         return exit_code
+    except BaseException as e:
+        slog.event("session_error", **_session_log.error_fields(e))
+        raise
     finally:
         if current is not None:
             await pool.release(current["lease"]["lease_id"], usage=usage)
+            slog.event("released", usage=None if usage is None else {
+                k: usage.get(k) for k in ("input_tokens", "output_tokens", "model")})
         await pool.aclose()
+        _session_log.CURRENT.reset(slog_token)
 
 
 def _start_usage(
@@ -1142,14 +1256,21 @@ async def _refresh_once(
     except Exception as e:  # noqa: BLE001
         if verbose:
             log.info("token refresh failed: %s", e)
+        _session_log.emit("token_refresh", result="failed",
+                          **_session_log.error_fields(e))
         return False
     if current["lease"]["lease_id"] != old_lease_id:
         if verbose:
             log.info("token refresh dropped (lease swapped during refresh)")
+        _session_log.emit("token_refresh", result="dropped_swapped")
         return False
     merged = {**current["lease"], **new}
     current["lease"] = merged
     provider.write_credentials(session_dir / provider.cred_filename, merged)
+    _session_log.emit(
+        "token_refresh", result="ok",
+        expires_in_s=round(float(merged.get("token_expires_at") or 0) - time.time()),
+    )
     if verbose:
         log.info("token refreshed (expires_at=%s)",
                  merged.get("token_expires_at"))

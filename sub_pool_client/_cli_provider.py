@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from sub_pool_client import _usage
+from sub_pool_client import _cred_guard, _usage
 
 
 def _write_claude_credentials(path: Path, lease: dict) -> None:
@@ -141,6 +141,24 @@ def _muse_quota_exhausted(line: str) -> bool:
     low = line.lower()
     return "api error 429" in low and (
         "rate_limit_error" in low or "quota exhausted" in low)
+
+
+# What claude prints when Anthropic has stopped the account until its owner
+# completes a verification check ("Your account can't receive replies from
+# Claude right now. ... Anthropic Verification Portal: https://portal...").
+# Mirrors sub_pool.accounts._VERIFICATION_MARKERS.
+_CLAUDE_VERIFICATION_MARKERS = (
+    "portal.anthropic.com/verify",
+    "anthropic verification portal",
+    "can't receive replies from claude",
+    "can\u2019t receive replies from claude",
+)
+ACCOUNT_VERIFICATION_CODE = "AccountVerificationRequired"
+
+
+def _claude_needs_verification(line: str) -> bool:
+    low = line.lower()
+    return any(m in low for m in _CLAUDE_VERIFICATION_MARKERS)
 
 
 def _seed_claude_home(home: Path) -> None:
@@ -267,6 +285,18 @@ class CliProvider:
     # it active the session CAN swap (the proxy reads the current lease per
     # request), overriding `live_swap`.
     api_proxy: ApiProxySpec | None = None
+    # (credential file, lease) -> secret-free description of the file, and
+    # that description -> why the CLI couldn't use it (None = fine). Both set:
+    # the session runs a `_cred_guard.CredentialGuard` that re-writes a file
+    # gone wrong and logs what it found. None: not guarded.
+    inspect_credentials: Callable[[Path, dict], dict] | None = None
+    credential_problem: Callable[[dict], str | None] | None = None
+    # line of child output -> "upstream has blocked this account until its
+    # owner acts" (claude: Anthropic's verification check). On a match the
+    # session reports it (code ACCOUNT_VERIFICATION_CODE, once per lease) so
+    # the pool takes the account out of rotation, then swaps off it. Only
+    # seen when output is watched (see _auth_watch.should_watch).
+    account_blocked: Callable[[str], bool] | None = None
 
 
 CLAUDE = CliProvider(
@@ -285,6 +315,9 @@ CLAUDE = CliProvider(
     write_credentials=_write_claude_credentials,
     init_home=_seed_claude_home,
     usage=_usage.ClaudeCliUsage,
+    inspect_credentials=_cred_guard.inspect_claude_credentials,
+    credential_problem=_cred_guard.claude_credential_problem,
+    account_blocked=_claude_needs_verification,
 )
 
 
