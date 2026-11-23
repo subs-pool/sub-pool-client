@@ -2,9 +2,11 @@
 be tested, and imported, without the `harbor` package)."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
+from pathlib import Path
 
 VENV = "/opt/subpool-client-venv"
 URL_ENV, KEY_ENV = "SUB_POOL_URL", "SUB_POOL_KEY"
@@ -110,5 +112,73 @@ for name in debug projects shell-snapshots statsig todos skills; do
     fi
 done
 
+# Harbor registers the task's MCP servers in its own .claude.json; sp-claude
+# runs on the pool home's copy, so carry them over (Harbor's entries win).
+if [ -f "$harbor_sessions/.claude.json" ]; then
+    /opt/subpool-client-venv/bin/python -m sub_pool_client._harbor_common \
+        merge-claude-mcp "$harbor_sessions/.claude.json" "$pool_home" || true
+fi
+
 exec "$sp_claude" --claude-bin "$direct" -- "$@"
 """
+
+# `__DIRECT__` is replaced with the preserved codex binary at install time.
+CODEX_WRAPPER = r"""#!/bin/sh
+set -eu
+
+direct="__DIRECT__"
+sp_codex="/opt/subpool-client-venv/bin/sp-codex"
+harbor_home="${CODEX_HOME:-}"
+pool_home="$HOME/.sub-pool/codex-home"
+
+# sp-codex points codex at its own temporary CODEX_HOME. Link in what Harbor
+# put in its CODEX_HOME — the config (MCP servers, base URL), the skills — and
+# the sessions dir Harbor copies the trajectory from when the run ends. The
+# leased auth.json stays private to sp-codex.
+if [ -n "$harbor_home" ]; then
+    mkdir -p "$pool_home" "$harbor_home/sessions"
+    for name in config.toml skills sessions; do
+        if [ -e "$harbor_home/$name" ] && [ ! -e "$pool_home/$name" ] && [ ! -L "$pool_home/$name" ]; then
+            ln -s "$harbor_home/$name" "$pool_home/$name"
+        fi
+    done
+fi
+
+exec "$sp_codex" --codex-bin "$direct" -- "$@"
+"""
+
+
+def merge_claude_mcp(src: Path, home: Path) -> None:
+    """Merge `mcpServers` from Harbor's .claude.json into the pool home's,
+    seeding the pool home first so onboarding state is still in place."""
+    from sub_pool_client._cli_provider import CLAUDE
+    home.mkdir(parents=True, exist_ok=True)
+    if CLAUDE.init_home is not None:
+        CLAUDE.init_home(home)
+    try:
+        theirs = json.loads(src.read_text()).get("mcpServers") or {}
+    except (OSError, ValueError, AttributeError):
+        return
+    if not isinstance(theirs, dict) or not theirs:
+        return
+    dst = home / ".claude.json"
+    try:
+        ours = json.loads(dst.read_text()) if dst.exists() else {}
+    except ValueError:
+        ours = {}
+    if not isinstance(ours, dict):
+        ours = {}
+    servers = ours.get("mcpServers") if isinstance(ours.get("mcpServers"), dict) else {}
+    ours["mcpServers"] = {**servers, **theirs}
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_text(json.dumps(ours, indent=2))
+    os.replace(tmp, dst)
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised inside the sandbox
+    import sys
+    if len(sys.argv) == 4 and sys.argv[1] == "merge-claude-mcp":
+        merge_claude_mcp(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        sys.exit("usage: python -m sub_pool_client._harbor_common "
+                 "merge-claude-mcp SRC HOME")

@@ -35,6 +35,7 @@ except ImportError as e:  # pragma: no cover - exercised only without harbor
 
 from sub_pool_client._harbor_common import (
     CLAUDE_WRAPPER,
+    CODEX_WRAPPER,
     VENV,
     client_requirement,
     install_command,
@@ -127,9 +128,11 @@ _CODEX_SWAP = (
     # Not `[ … ] && continue`: under set -e that AND-list fails the script.
     'if [ "$target" = "$direct" ]; then continue; fi; '
     'rm -f "$target"; '
-    f"printf '#!/bin/sh\\nset -eu\\nexec {VENV}/bin/sp-codex "
-    '--codex-bin %s -- "$@"\\n\' "$direct" > "$target"; '
-    'chmod 755 "$target"; '
+    f'"{VENV}/bin/python" -c \'import pathlib, sys; '
+    "p = pathlib.Path(sys.argv[1]); "
+    "p.write_text(sys.argv[2].replace(\"__DIRECT__\", sys.argv[3])); "
+    "p.chmod(0o755)' "
+    f'"$target" {shlex.quote(CODEX_WRAPPER)} "$direct"; '
     "done; "
     '"$direct" --version; '
     f'"{VENV}/bin/sp-codex" --help >/dev/null'

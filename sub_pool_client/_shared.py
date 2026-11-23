@@ -100,6 +100,55 @@ def _new_request_id() -> str:
 
 
 RELEASE_ATTEMPTS = 3
+
+# The pool credential and where it points. Never handed to a child CLI: the
+# model can run `env` (in a Harbor sandbox, trivially), and the key leases
+# every account in its sub-pool. The child has its own leased credential.
+POOL_ENV_VARS = ("SUB_POOL_KEY", "SUB_POOL_URL", "SUB_POOL_KEY_NAME")
+
+
+def error_fields(exc: BaseException | None, kinds: tuple[type, ...]) -> dict:
+    """The release body's error fields for `exc`, or {} when it is none of
+    ours to report.
+
+    Only exceptions from the pool/SDK layer (`kinds`) say anything about the
+    account. A caller's own exception leaving the `async with` (a ValueError,
+    a test assertion, a class that happens to be called RateLimitExceeded)
+    was being sent as the error code, and the pool classifies codes by
+    keyword: a shared account got cooled for a bug in someone's script.
+    Cancellation and Ctrl-C are a clean release, not a failure.
+    """
+    if exc is None or not isinstance(exc, kinds):
+        return {}
+    return {"error_code": type(exc).__name__, "error_message": str(exc)[:2000]}
+
+
+async def shielded_cleanup(*steps: Awaitable | None) -> None:
+    """Run `steps` in order in their own task, so a cancellation of the
+    caller can't stop them half-way.
+
+    `__aexit__` runs inside the caller's cancel scope. Under anyio (or a
+    `TaskGroup` / `asyncio.timeout` tearing down), every await in it is
+    cancelled at once, so the release request never went out and the lease
+    sat on the account until the reaper. Shielded, the release finishes in
+    the background and the cancellation still propagates to the caller.
+    """
+    async def run() -> None:
+        for step in steps:
+            if step is None:
+                continue
+            try:
+                await step
+            except Exception as e:  # noqa: BLE001 — one failed step mustn't skip the rest
+                log.warning("cleanup step failed: %s", e)
+
+    task = asyncio.ensure_future(run())
+    await asyncio.shield(task)
+
+
+def without_pool_env(env: dict[str, str]) -> dict[str, str]:
+    """`env` minus POOL_ENV_VARS (a copy)."""
+    return {k: v for k, v in env.items() if k not in POOL_ENV_VARS}
 RELEASE_BACKOFF_S = 0.5
 
 
@@ -211,9 +260,14 @@ def dir_key(
     provider: str = "claude",
     user_id: str | None = None,
     required_model: str | None = None,
+    required_features: list[str] | None = None,
 ) -> str:
     """Deterministic short hash. Same inputs → same shared dir → two
-    concurrent PooledClient instances meet."""
+    concurrent PooledClient instances meet.
+
+    Everything that narrows which account the pool may pick belongs here:
+    a client asking for features X joining a lease issued without them
+    would get an account the pool never checked for X."""
     parts = [
         provider or "claude",
         pool_url.rstrip("/"),
@@ -221,6 +275,9 @@ def dir_key(
         user_id or "",
         required_model or "",
     ]
+    if required_features:
+        # Appended only when set, so existing feature-less dirs keep their key.
+        parts.append(",".join(sorted(set(required_features))))
     digest = hashlib.sha256("|".join(parts).encode()).hexdigest()
     return digest[:24]
 

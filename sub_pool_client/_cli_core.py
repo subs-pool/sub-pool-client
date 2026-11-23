@@ -30,6 +30,8 @@ from sub_pool_client._client_id import client_version
 from sub_pool_client._cli_provider import ACCOUNT_VERIFICATION_CODE, CliProvider
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
+    POOL_ENV_VARS,
+    without_pool_env,
     LeaseRequestId,
     check_pool_url,
     next_refresh_sleep,
@@ -173,7 +175,7 @@ class Config:
             return None
 
         per_provider: dict[str, dict[str, str]] = {}
-        for name in ("claude", "codex"):
+        for name in _PROVIDER_SECTIONS:
             section = data.get(name)
             if isinstance(section, dict):
                 per_provider[name] = {
@@ -198,7 +200,7 @@ class Config:
             body += "\n[keys]\n"
             for name, key in self.keys.items():
                 body += f"{name} = {_toml_str(key)}\n"
-        for name in ("claude", "codex"):
+        for name in _PROVIDER_SECTIONS:
             section = self._per_provider.get(name)
             if not section:
                 continue
@@ -213,6 +215,12 @@ class Config:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(body)
+
+
+# Every sp-* CLI's section. Listing only claude and codex here meant [grok]
+# and [muse] were never read, and the next `--setup` rewrote the file without
+# them.
+_PROVIDER_SECTIONS = ("claude", "codex", "grok", "muse")
 
 
 def _toml_str(s: str) -> str:
@@ -722,7 +730,8 @@ async def run_session(
         interactive=not any(a in ("-p", "--print") for a in prompt_args),
         watch_output=_auth_watch.should_watch(),
         others=_session_log.other_sessions(provider.name),
-        stripped_env=sorted(k for k in provider.bypass_env_vars if k in os.environ),
+        stripped_env=sorted(k for k in (*provider.bypass_env_vars, *POOL_ENV_VARS)
+                            if k in os.environ),
     )
     # Set once we hold a lease. The outer finally releases whatever it points
     # at by then (a swap may have advanced it), however the session ends —
@@ -766,7 +775,7 @@ async def run_session(
                 session_dir / provider.cred_filename, lease,
             )
 
-            env = os.environ.copy()
+            env = without_pool_env(os.environ)
             if provider.config_dir_env is not None:
                 env[provider.config_dir_env] = str(session_dir)
             for k in provider.bypass_env_vars:
@@ -1195,7 +1204,9 @@ async def run_session(
             with suppress(Exception):
                 commit_session_to_home(session_dir, home_dir, provider)
             shutil.rmtree(session_dir, ignore_errors=True)
-        return exit_code
+        # A child killed by signal N reports -N; exit as a shell would (128+N),
+        # not sys.exit(-N) → 256-N, which reads as an ordinary failure.
+        return 128 - exit_code if exit_code < 0 else exit_code
     except BaseException as e:
         slog.event("session_error", **_session_log.error_fields(e))
         raise

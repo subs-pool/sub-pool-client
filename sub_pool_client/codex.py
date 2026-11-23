@@ -34,6 +34,9 @@ from sub_pool_client._client_id import client_headers
 from sub_pool_client import _usage
 from sub_pool_client._health_watcher import HealthWatcher
 from sub_pool_client._shared import (
+    shielded_cleanup,
+    error_fields,
+    without_pool_env,
     LeaseRequestId,
     check_pool_url,
     cleanup_dir,
@@ -125,6 +128,7 @@ class PooledCodexClient:
             provider="codex",
             user_id=self._user_id,
             required_model=self._required_model,
+            required_features=self._required_features,
         )
         await sweep_stale_dirs_once()
         self._dir = shared_dir(key)
@@ -156,9 +160,8 @@ class PooledCodexClient:
                 except (asyncio.CancelledError, Exception):
                     pass
                 setattr(self, attr, None)
-        await self._leave_lease(exc)
-        if self._owned_http:
-            await self._http.aclose()
+        await shielded_cleanup(self._leave_lease(exc),
+                               self._http.aclose() if self._owned_http else None)
 
     @property
     def codex_home(self) -> Path:
@@ -168,7 +171,7 @@ class PooledCodexClient:
 
     @property
     def env(self) -> dict[str, str]:
-        env = os.environ.copy()
+        env = without_pool_env(os.environ)
         env["CODEX_HOME"] = str(self.codex_home)
         # Avoid an ambient API key taking precedence over the leased auth.json.
         env.pop("OPENAI_API_KEY", None)
@@ -279,6 +282,12 @@ class PooledCodexClient:
                         self._is_poll_leader = True
                     return
 
+                if meta.lease_id:
+                    # Every holder of the previous lease died without
+                    # releasing it (see client.py): release it now.
+                    stale, meta.lease_id = meta.lease_id, None
+                    with contextlib.suppress(Exception):
+                        await self._delete_lease(stale, None)
                 lease = await self._post_lease(
                     self._request_id_req or self._lease_rid.value,
                 )
@@ -646,10 +655,7 @@ class PooledCodexClient:
         usage: dict | None = None,
     ) -> None:
         """`usage` only on the shared session's final release, never a swap's."""
-        body: dict[str, Any] = {}
-        if exc is not None:
-            body["error_code"] = type(exc).__name__
-            body["error_message"] = str(exc)[:2000]
+        body: dict[str, Any] = error_fields(exc, (PoolError,))
         wire = _usage.to_wire(usage)
         if wire is not None:
             body["usage"] = wire
